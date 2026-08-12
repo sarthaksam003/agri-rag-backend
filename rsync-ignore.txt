@@ -1,0 +1,11 @@
+*.log
+*.tmp
+.git
+node_modules
+__pycache__
+*.pyc
+thumbs.db
+.DS_Store
+deployment
+.venv
+

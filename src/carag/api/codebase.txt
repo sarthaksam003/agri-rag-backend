@@ -1,0 +1,934 @@
+Project Path: api
+
+Source Tree:
+
+```txt
+api
+├── __init__.py
+├── dependencies.py
+├── history.py
+├── main.py
+├── routes
+│   ├── __init__.py
+│   ├── chat.py
+│   ├── documents.py
+│   ├── multiquery_chat.py
+│   ├── sessions.py
+│   ├── tts.py
+│   └── voice_chat.py
+└── schemas.py
+
+```
+
+`dependencies.py`:
+
+```py
+from functools import lru_cache
+
+from fastapi import Header, HTTPException
+
+from carag.core.config import get_settings
+
+settings = get_settings()
+
+
+@lru_cache
+def get_tenant_id(x_tenant_id: str = Header("demo-tenant")) -> str:
+    """
+    Dependency to get tenant ID from header.
+    For now, defaults to 'demo-tenant' until JWT auth is implemented.
+    """
+    # TODO: Add JWT validation later
+    if not x_tenant_id:
+        raise HTTPException(status_code=400, detail="Tenant ID header is required")
+
+    return x_tenant_id
+
+
+def get_ingestion_engine(tenant_id: str):
+    """Dependency to get ingestion engine for a tenant."""
+    from carag.services.document_ingestion.ingest import get_ingestion_engine
+
+    return get_ingestion_engine(tenant_id=tenant_id)
+
+```
+
+`history.py`:
+
+```py
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from langchain_core.messages import BaseMessage, messages_from_dict, messages_to_dict
+
+from carag.core.constants import get_constants
+
+constants = get_constants()
+
+_KEY_PREFIX = "carag:chat_history"
+_TENANT_SEPARATOR = ":"
+
+
+def _key(session_id: str, tenant_id: str) -> str:
+    """Return a tenant-scoped Redis key: carag:chat_history:<tenant>:<session>"""
+    return f"{_KEY_PREFIX}{_TENANT_SEPARATOR}{tenant_id}{_TENANT_SEPARATOR}{session_id}"
+
+
+def get(session_id: str, tenant_id: str) -> list[BaseMessage]:
+    """Fetch a conversation from Redis.  Returns empty list if missing."""
+    data: bytes | None = constants.redis_client.get(_key(session_id, tenant_id))
+    if data is None:
+        return []
+    # messages_to_dict / from_dict keeps the correct message types
+    return messages_from_dict(json.loads(data.decode()))
+
+
+def set(
+    session_id: str,
+    tenant_id: str,
+    messages: list[BaseMessage],
+    ex: int | None = None,
+) -> None:
+    """Store (or overwrite) a conversation.  Optional TTL in seconds."""
+    constants.redis_client.set(
+        _key(session_id, tenant_id),
+        json.dumps(messages_to_dict(messages)).encode(),
+        ex=ex,
+    )
+
+
+def delete(session_id: str, tenant_id: str) -> int:
+    """Delete a session.  Returns the number of keys removed (0 or 1)."""
+    return constants.redis_client.delete(_key(session_id, tenant_id))
+
+
+def list_sessions(tenant_id: str) -> list[str]:
+    """Return all session-IDs for a tenant (without the prefix)."""
+    pattern = f"{_KEY_PREFIX}{_TENANT_SEPARATOR}{tenant_id}{_TENANT_SEPARATOR}*"
+    keys = constants.redis_client.scan_iter(match=pattern, count=500)
+    # strip prefix + tenant
+    prefix_len = len(_KEY_PREFIX) + len(tenant_id) + 2
+    return [k.decode()[prefix_len:] for k in keys]
+
+
+class _HistoryFacade:
+    def get(self, composite_key: str, default: Any | None = None) -> Any:
+        """
+        Mimics dict.get() so existing code like
+            messages_history = conversation_history.get(session_id, [])
+        keeps working.
+        """
+        if composite_key in self:
+            return self[composite_key]
+        return default
+
+    def __getitem__(self, composite_key: str) -> list[BaseMessage]:
+        # composite_key is f"{session_id}||{tenant_id}" (or change to taste)
+        session_id, tenant_id = composite_key.split("||", 1)
+        return get(session_id, tenant_id)
+
+    def __setitem__(self, composite_key: str, messages: list[BaseMessage]) -> None:
+        session_id, tenant_id = composite_key.split("||", 1)
+        set(session_id, tenant_id, messages)
+
+    def __delitem__(self, composite_key: str) -> None:
+        session_id, tenant_id = composite_key.split("||", 1)
+        delete(session_id, tenant_id)
+
+    def __contains__(self, composite_key: str) -> bool:
+        session_id, tenant_id = composite_key.split("||", 1)
+        return constants.redis_client.exists(_key(session_id, tenant_id)) == 1
+
+    def keys(self):
+        """Iterate over *all* composite keys in DB-1 (use sparingly)."""
+        pattern = f"{_KEY_PREFIX}{_TENANT_SEPARATOR}*"
+        for key in constants.redis_client.scan_iter(match=pattern, count=500):
+            # key is b'carag:chat_history:<tenant>:<session>'
+            _, _, tenant, session = key.decode().split(_TENANT_SEPARATOR, 3)
+            yield f"{session}||{tenant}"
+
+
+conversation_history: _HistoryFacade = _HistoryFacade()
+
+```
+
+`main.py`:
+
+```py
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from carag.api.routes import chat, documents, sessions
+from carag.api.routes.multiquery_chat import router as multiquery_router
+from carag.api.routes.tts import router as tts_router
+from carag.api.routes.voice_chat import router as voice_router
+
+app = FastAPI(
+    title="Carag RAG API", description="Multi-tenant RAG Chatbot API", version="1.0.0"
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure based on your frontend
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include routers
+app.include_router(chat.router, prefix="/api/v1/chat", tags=["chat"])
+app.include_router(documents.router, prefix="/api/v1/documents", tags=["documents"])
+app.include_router(sessions.router, prefix="/api/v1/sessions", tags=["sessions"])
+app.include_router(
+    multiquery_router, prefix="/api/v1/multiquery-chat", tags=["multiquery-chat"]
+)
+app.include_router(voice_router, prefix="/api/v1/voice-chat", tags=["voice-chat"])
+app.include_router(tts_router, prefix="/api/v1/tts", tags=["tts"])
+
+
+@app.get("/")
+async def root():
+    return
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+```
+
+`routes/chat.py`:
+
+```py
+import uuid
+from datetime import datetime
+
+from fastapi import APIRouter, Depends
+
+from carag.api.dependencies import get_tenant_id
+from carag.api.schemas import (
+    ChatMessageRequest,
+    ChatMessageResponse,
+    ErrorResponse,
+)
+from carag.services.chat_service import run_rag_pipeline
+
+router = APIRouter()
+
+
+@router.post(
+    "/message",
+    response_model=ChatMessageResponse,
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+)
+async def send_chat_message(
+    request: ChatMessageRequest,
+    tenant_id: str = Depends(get_tenant_id),
+) -> ChatMessageResponse:
+    """Send a text message to the RAG chatbot."""
+    result = await run_rag_pipeline(
+        message=request.message,
+        session_id=request.session_id,
+        tenant_id=tenant_id,
+    )
+
+    return ChatMessageResponse(
+        id=str(uuid.uuid4()),
+        session_id=result.session_id,
+        message=result.user_message,
+        response=result.response,
+        timestamp=datetime.now(),
+        chunks=result.chunks,
+        hallucination_spans=result.hallucination_result,
+        retrieved_documents_count=result.retrieved_documents_count,
+    )
+
+```
+
+`routes/documents.py`:
+
+```py
+import asyncio
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+
+from celery.result import AsyncResult
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
+from loguru import logger
+
+from carag.api.dependencies import get_ingestion_engine, get_tenant_id
+from carag.api.schemas import (
+    BatchDocumentIngestionResponse,
+    DeleteDocumentResponse,
+    DeleteTenantResponse,
+    DocumentIngestionResponse,
+    ErrorResponse,
+    SuccessResponse,
+)
+from carag.worker import celery_app
+from carag.worker.tasks import ingest_document
+
+router = APIRouter()
+_pool = ThreadPoolExecutor(max_workers=4)
+
+
+async def _run_in_thread(fn, *args, **kwargs):
+    """Run a *blocking* function in a thread-pool and await the result."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_pool, fn, *args, **kwargs)
+
+
+@router.get("/jobs/{job_id}")
+async def get_job_status(job_id: str):
+    try:
+        res = AsyncResult(job_id, app=celery_app)
+
+        if res.result is None and res.state == "PENDING":
+            try:
+                res.get(timeout=0.1)
+            except Exception:
+                return {
+                    "job_id": job_id,
+                    "status": "not_found",
+                    "error": "Job does not exist",
+                }
+        if res.state == "PENDING":
+            return {"job_id": job_id, "status": "processing"}
+        elif res.state == "SUCCESS":
+            return {"job_id": job_id, **res.result}
+        else:  # FAILURE
+            return {"job_id": job_id, "status": "failed", "error": str(res.info)}
+    except Exception as e:
+        logger.error(f"Error checking job status {job_id}: {e}")
+        return {"job_id": job_id, "status": "error", "error": str(e)}
+
+
+@router.post(
+    "/ingest",
+    status_code=202,
+    response_model=BatchDocumentIngestionResponse,
+    responses={400: {"model": ErrorResponse}},
+)
+async def ingest_documents(
+    background: BackgroundTasks,
+    files: list[UploadFile] = File(...),
+    tenant_id: str = Depends(get_tenant_id),
+) -> BatchDocumentIngestionResponse:
+    """
+    Accepts PDFs, creates a job per file, returns immediately.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
+
+    processed_files = []
+    for file in files:
+        if not file.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail=f"{file.filename} is not a PDF")
+
+        document_id = str(uuid.uuid4())
+        blob = await file.read()
+        meta = {
+            "document_id": document_id,
+            "original_filename": file.filename,
+            "ingested_at": datetime.utcnow().isoformat(),
+            "tenant_id": tenant_id,
+        }
+
+        # Fire-and-forget Celery task
+        task = ingest_document.delay(tenant_id, file.filename, blob, meta)
+
+        processed_files.append(
+            DocumentIngestionResponse(
+                document_id=document_id,
+                filename=file.filename,
+                status="processing",
+                job_id=task.id,  # <-- new field
+            )
+        )
+
+    return BatchDocumentIngestionResponse(
+        processed_files=processed_files,
+        total_processed=len(processed_files),
+        total_failed=0,
+    )
+
+
+@router.get(
+    "/",
+    response_model=SuccessResponse,
+    responses={500: {"model": ErrorResponse}},
+)
+async def list_ingested_documents(
+    tenant_id: str = Depends(get_tenant_id),
+) -> SuccessResponse:
+    """
+    List all ingested documents for the current tenant.
+    Uses Qdrant to fetch document metadata.
+    """
+    try:
+        ingestion_engine = get_ingestion_engine(tenant_id)
+
+        # Get collection info to show document count
+        docs = ingestion_engine.list_documents()
+        # TODO: Implement detailed document listing from Qdrant metadata
+        # For now, return basic collection info
+
+        return SuccessResponse(
+            message="Documents retrieved successfully",
+            data={
+                "tenant_id": tenant_id,
+                "total_documents": len(docs),
+                "documents": docs,
+            },
+        )
+
+    except Exception as e:
+        logger.error(f"Error listing documents: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete(
+    "/{document_id}",
+    response_model=DeleteDocumentResponse,
+    responses={404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+)
+async def delete_document(
+    document_id: str,
+    tenant_id: str = Depends(get_tenant_id),
+) -> DeleteDocumentResponse:
+    """
+    Delete a specific document and all its chunks for the current tenant.
+    """
+    try:
+        ingestion_engine = get_ingestion_engine(tenant_id)
+
+        success, deleted_chunks = ingestion_engine.delete_documents_by_document_id(
+            document_id
+        )
+
+        if not success or deleted_chunks == 0:
+            raise HTTPException(
+                status_code=404, detail=f"Document {document_id} not found"
+            )
+
+        return DeleteDocumentResponse(
+            message=f"Document {document_id} deleted successfully",
+            deleted_chunks=deleted_chunks,
+            document_id=document_id,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting document {document_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete(
+    "/tenant/all",
+    response_model=DeleteTenantResponse,
+    responses={500: {"model": ErrorResponse}},
+)
+async def delete_all_tenant_documents(
+    tenant_id: str = Depends(get_tenant_id),
+) -> DeleteTenantResponse:
+    """
+    Delete ALL documents and chunks for the current tenant.
+    Use with caution - this action cannot be undone.
+    """
+    try:
+        ingestion_engine = get_ingestion_engine(tenant_id)
+
+        # Get current count before deletion
+        before_count = ingestion_engine.get_tenant_document_count()
+
+        # Delete all tenant data
+        success = ingestion_engine.delete_tenant_data()
+
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to delete tenant data")
+
+        deleted_chunks = before_count
+
+        return DeleteTenantResponse(
+            message=f"All documents for tenant {tenant_id} deleted successfully",
+            deleted_chunks=deleted_chunks,
+            tenant_id=tenant_id,
+        )
+
+    except Exception as e:
+        logger.error(f"Error deleting all documents for tenant {tenant_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+```
+
+`routes/multiquery_chat.py`:
+
+```py
+import uuid
+from datetime import datetime
+
+from fastapi import APIRouter, Depends
+
+from carag.api.dependencies import get_tenant_id
+from carag.api.schemas import (
+    ErrorResponse,
+    MultiqueryChatMessageRequest,
+    MultiqueryChatMessageResponse,
+    RetrievalInfo,
+)
+from carag.services.chat_service import RagMode, run_rag_pipeline
+
+router = APIRouter()
+
+
+@router.post(
+    "/message",
+    response_model=MultiqueryChatMessageResponse,
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+)
+async def send_multiquery_chat_message(
+    request: MultiqueryChatMessageRequest,
+    tenant_id: str = Depends(get_tenant_id),
+) -> MultiqueryChatMessageResponse:
+    """Send a message using Multiquery RAG approach."""
+    result = await run_rag_pipeline(
+        message=request.message,
+        session_id=request.session_id,
+        tenant_id=tenant_id,
+        mode=RagMode.MULTIQUERY,
+    )
+
+    # Convert RetrievalDetail to RetrievalInfo for API schema
+    chunk_retrieval_info = [
+        RetrievalInfo(
+            chunk_id=detail.chunk_id,
+            source_queries=detail.source_queries,
+            retrieval_score=detail.retrieval_score,
+            metadata=detail.metadata,
+        )
+        for detail in result.chunk_retrieval_info
+    ]
+
+    return MultiqueryChatMessageResponse(
+        id=str(uuid.uuid4()),
+        session_id=result.session_id,
+        message=result.user_message,
+        response=result.response,
+        timestamp=datetime.now(),
+        chunks=result.chunks,
+        hallucination_spans=result.hallucination_result,
+        retrieved_documents_count=result.retrieved_documents_count,
+        generated_queries=result.generated_queries,
+        retrieval_strategy="multiquery_with_provenance",
+        retrieval_analysis=result.retrieval_analysis,
+        chunk_retrieval_info=chunk_retrieval_info,
+    )
+
+```
+
+`routes/sessions.py`:
+
+```py
+from datetime import datetime
+
+from fastapi import APIRouter, Depends
+
+from carag.api.dependencies import get_tenant_id
+from carag.api.history import conversation_history
+from carag.api.schemas import SuccessResponse
+
+router = APIRouter()
+
+
+@router.get("/health", response_model=SuccessResponse)
+async def sessions_health_check(
+    tenant_id: str = Depends(get_tenant_id),
+) -> SuccessResponse:
+    """
+    Health check for sessions endpoint.
+    TODO: Implement session management with PostgreSQL
+    """
+    return SuccessResponse(message="Sessions endpoint is healthy")
+
+
+# TODO: Implement session management endpoints
+# - POST /sessions - Create new session
+
+
+@router.get("/sessions/{session_id}/history", response_model=SuccessResponse)
+async def get_chat_history(
+    session_id: str,
+    tenant_id: str = Depends(get_tenant_id),
+) -> SuccessResponse:
+    """
+    Get chat history for a specific session.
+    """
+    messages_history = conversation_history.get(f"{session_id}||{tenant_id}", [])
+
+    # Convert to simple format for response
+    history_data = []
+    for i in range(0, len(messages_history), 2):
+        if i + 1 < len(messages_history):
+            history_data.append(
+                {
+                    "user": messages_history[i].content,
+                    "assistant": messages_history[i + 1].content,
+                }
+            )
+
+    return SuccessResponse(
+        message="Chat history retrieved successfully",
+        data={
+            "session_id": session_id,
+            "history": history_data,
+            "total_messages": len(messages_history),
+        },
+    )
+
+
+@router.delete("/sessions/{session_id}", response_model=SuccessResponse)
+async def delete_chat_session(
+    session_id: str,
+    tenant_id: str = Depends(get_tenant_id),
+) -> SuccessResponse:
+    """
+    Delete a specific chat session and its history.
+    """
+
+    if f"{session_id}||{tenant_id}" in conversation_history:
+        del conversation_history[f"{session_id}||{tenant_id}"]
+
+    return SuccessResponse(message=f"Session {session_id} deleted successfully")
+
+
+@router.get("/sessions", response_model=SuccessResponse)
+async def list_chat_sessions(
+    tenant_id: str = Depends(get_tenant_id),
+    limit: int = 20,
+    offset: int = 0,
+) -> SuccessResponse:
+    """
+    List chat sessions for the current tenant.
+    """
+    sessions = [
+        s.split("||", 1)[0]
+        for s in conversation_history.keys()
+        if s.endswith(f"||{tenant_id}")
+    ][offset : offset + limit]
+
+    session_data = []
+    for session_id in sessions:
+        messages = conversation_history[f"{session_id}||{tenant_id}"]
+        session_data.append(
+            {
+                "session_id": session_id,
+                "message_count": len(messages),
+                "last_updated": datetime.now(),
+            }
+        )
+    tenant_keys = [
+        k for k in conversation_history.keys() if k.endswith(f"||{tenant_id}")
+    ]
+    total = len(tenant_keys)
+    sessions = [k.split("||", 1)[0] for k in tenant_keys][offset : offset + limit]
+    return SuccessResponse(
+        message="Chat sessions retrieved successfully",
+        data={
+            "sessions": session_data,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        },
+    )
+
+```
+
+`routes/tts.py`:
+
+```py
+from fastapi import APIRouter, Depends
+from fastapi.responses import Response
+
+from carag.api.dependencies import get_tenant_id
+from carag.api.schemas import ErrorResponse, TTSRequest
+from carag.services.bhasini import synthesize
+
+router = APIRouter()
+
+
+@router.post(
+    "/synthesize",
+    responses={
+        200: {"content": {"audio/wav": {}}},
+        400: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
+)
+async def text_to_speech(
+    request: TTSRequest,
+    tenant_id: str = Depends(get_tenant_id),
+) -> Response:
+    """
+    Lazy TTS — converts text to speech on demand.
+    Called when user clicks the speaker button.
+    Returns raw audio bytes.
+    """
+    audio_bytes = await synthesize(
+        text=request.text,
+        target_language=request.language,
+        gender=request.gender,
+    )
+
+    return Response(
+        content=audio_bytes,
+        media_type="audio/wav",
+        headers={
+            "Content-Disposition": "inline; filename=speech.wav",
+        },
+    )
+
+```
+
+`routes/voice_chat.py`:
+
+```py
+import uuid
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, Form, UploadFile
+from loguru import logger
+
+from carag.api.dependencies import get_tenant_id
+from carag.api.schemas import ErrorResponse, VoiceChatResponse
+from carag.core.config import get_settings
+from carag.services.bhasini import transcribe, translate
+from carag.services.chat_service import RagMode, run_rag_pipeline
+
+router = APIRouter()
+settings = get_settings()
+
+
+@router.post(
+    "/message",
+    response_model=VoiceChatResponse,
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+)
+async def voice_chat_message(
+    audio: UploadFile,
+    source_language: str = Form(default="hi"),
+    session_id: str | None = Form(default=None),
+    rag_mode: str = Form(default="simple"),  # "simple" or "multiquery"
+    tenant_id: str = Depends(get_tenant_id),
+) -> VoiceChatResponse:
+    """
+    Voice message to RAG chatbot.
+    Audio in → ASR → translate → RAG → translate back → text out.
+    Supports both simple and multiquery RAG modes.
+    """
+    rag_language = settings.BHASINI_SOURCE_LANGUAGE
+    needs_translation = source_language != rag_language
+    mode = RagMode(rag_mode)
+
+    # Step 1: ASR
+    audio_bytes = await audio.read()
+    logger.info(
+        f"Voice input: {len(audio_bytes)} bytes, "
+        f"language: {source_language}, mode: {mode.value}"
+    )
+    user_text = await transcribe(audio_bytes, source_language)
+
+    # Step 2: Translate to RAG language (if needed)
+    translated_message = None
+    rag_input = user_text
+    if needs_translation:
+        translated_message = await translate(
+            text=user_text,
+            source_language=source_language,
+            target_language=rag_language,
+        )
+        rag_input = translated_message
+
+    # Step 3: RAG pipeline
+    result = await run_rag_pipeline(
+        message=rag_input,
+        session_id=session_id,
+        tenant_id=tenant_id,
+        mode=mode,
+    )
+
+    # Step 4: Translate response back (if needed)
+    translated_response = None
+    if needs_translation:
+        translated_response = await translate(
+            text=result.response,
+            source_language=rag_language,
+            target_language=source_language,
+        )
+
+    return VoiceChatResponse(
+        id=str(uuid.uuid4()),
+        session_id=result.session_id,
+        original_message=user_text,
+        translated_message=translated_message,
+        response=result.response,
+        translated_response=translated_response,
+        source_language=source_language,
+        timestamp=datetime.now(),
+        chunks=result.chunks,
+        hallucination_spans=result.hallucination_result,
+        retrieved_documents_count=result.retrieved_documents_count,
+    )
+
+```
+
+`schemas.py`:
+
+```py
+from datetime import datetime
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+# Chat Schemas
+class ChatMessageRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=4000)
+    session_id: str | None = None
+
+
+class ChatMessageResponse(BaseModel):
+    id: str
+    session_id: str
+    message: str
+    response: str
+    timestamp: datetime
+    chunks: list[str]
+    hallucination_spans: dict[str, Any] | None = None
+    retrieved_documents_count: int = 0
+
+
+class ChatSession(BaseModel):
+    id: str
+    title: str
+    created_at: datetime
+    message_count: int
+    last_message_at: datetime | None = None
+
+
+# Document Schemas
+class DocumentIngestionRequest(BaseModel):
+    metadata: dict[str, Any] | None = None
+
+
+class DocumentIngestionResponse(BaseModel):
+    document_id: str
+    filename: str
+    status: str  # processing, completed, failed
+    chunks_processed: int = 0
+    total_chunks: int = 0
+    processing_time: float | None = None
+    error_message: str | None = None
+    job_id: str | None = None
+
+
+class DocumentInfo(BaseModel):
+    document_id: str
+    filename: str
+    file_size: int
+    ingested_at: datetime
+    chunk_count: int
+    status: str
+
+
+class BatchDocumentIngestionResponse(BaseModel):
+    processed_files: list[DocumentIngestionResponse]
+    total_processed: int
+    total_failed: int
+
+
+class DeleteDocumentResponse(BaseModel):
+    message: str
+    deleted_chunks: int
+    document_id: str
+
+
+class DeleteTenantResponse(BaseModel):
+    message: str
+    deleted_chunks: int
+    tenant_id: str
+
+
+# Generic Response Schemas
+class ErrorResponse(BaseModel):
+    error: str
+    details: dict[str, Any] | None = None
+
+
+class SuccessResponse(BaseModel):
+    message: str
+    data: dict[str, Any] | None = None
+
+
+class MultiqueryChatMessageRequest(ChatMessageRequest):
+    """Extended request for multiquery RAG with additional options"""
+
+    use_multiquery: bool = Field(default=True)
+    max_queries: int = Field(default=6, ge=1, le=6)
+
+
+class RetrievalInfo(BaseModel):
+    """Information about how a chunk was retrieved"""
+
+    chunk_id: int
+    source_queries: list[str]
+    retrieval_score: float | None = None
+    metadata: dict[str, Any]
+
+
+class MultiqueryChatMessageResponse(ChatMessageResponse):
+    """Extended response for multiquery RAG"""
+
+    generated_queries: list[str] = Field(default_factory=list)
+    retrieval_strategy: str = "multiquery"
+    retrieval_analysis: dict[str, Any] = Field(default_factory=dict)
+    chunk_retrieval_info: list[RetrievalInfo] = Field(default_factory=list)
+
+
+# Voice Chat Schemas
+class VoiceChatRequest(BaseModel):
+    """Received as form data, not JSON — audio comes as UploadFile."""
+
+    session_id: str | None = None
+    source_language: str = Field(
+        default="hi", description="Language of the audio input"
+    )
+
+
+class VoiceChatResponse(BaseModel):
+    id: str
+    session_id: str
+    original_message: str  # what ASR heard (in source language)
+    translated_message: str | None  # translated to RAG language (if applicable)
+    response: str  # RAG response (in RAG language)
+    translated_response: (
+        str | None
+    )  # translated back to source language (if applicable)
+    source_language: str
+    timestamp: datetime
+    chunks: list[str]
+    hallucination_spans: dict[str, Any] | None = None
+    retrieved_documents_count: int = 0
+
+
+# TTS Schemas
+class TTSRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=5000)
+    language: str = Field(default="hi")
+    gender: str = Field(default="female")
+
+```

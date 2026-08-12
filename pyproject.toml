@@ -1,0 +1,49 @@
+[project]
+name = "carag"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Bhaswata Choudhury", email = "eeb20007@tezu.ac.in" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "celery[redis]>=5.3.1",
+    "chonkie[table]>=1.3.1",
+    "fastapi-users[beanie,oauth]>=14.0.1",
+    "fastapi[standard]>=0.118.0",
+    "fastembed-gpu>=0.7.3",
+    "html-to-markdown>=1.16.0",
+    "httpx>=0.28.1",
+    "langchain>=0.3.27",
+    "langchain-openai>=0.3.34",
+    "langchain-qdrant>=0.2.1",
+    "langfuse>=3.6.1",
+    "langgraph>=0.6.8",
+    "markdownify>=1.2.0",
+    "mineru>=2.5.4",
+    "pydantic>=2.11.9",
+    "pydantic-settings>=2.11.0",
+    "redis>=6.4.0",
+    "tokenizers>=0.22.1",
+    "trustcall>=0.0.39",
+]
+
+[project.scripts]
+carag = "carag:main"
+
+[build-system]
+requires = ["uv_build>=0.8.4,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
+    "pytest-cov>=7.0.0",
+    "pytest-mock>=3.15.1",
+    "pytest-xdist>=3.8.0",
+    "python-dotenv>=1.1.1",
+    "tqdm>=4.67.1",
+]
+

@@ -1,0 +1,129 @@
+import sys
+import traceback
+import uuid
+from datetime import datetime
+
+from fastapi import APIRouter, Depends
+from langchain_core.messages import AIMessage, HumanMessage
+from loguru import logger
+
+from carag.api.dependencies import get_tenant_id
+from carag.api.history import conversation_history
+from carag.api.schemas import (
+    ErrorResponse,
+    MultiqueryChatMessageRequest,
+    MultiqueryChatMessageResponse,
+    RetrievalInfo,
+)
+from carag.core.constants import get_constants
+from carag.services.rag_engine.mqrag import mqgraph as multiquery_graph
+
+router = APIRouter()
+constants = get_constants()
+
+
+@router.post(
+    "/message",
+    response_model=MultiqueryChatMessageResponse,
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+)
+async def send_multiquery_chat_message(
+    request: MultiqueryChatMessageRequest,
+    tenant_id: str = Depends(get_tenant_id),
+) -> MultiqueryChatMessageResponse:
+    """
+    Send a message using Multiquery RAG approach with enhanced query context.
+    Generates multiple query variations and tracks retrieval provenance.
+    """
+    try:
+        # Generate session ID if not provided
+        session_id = request.session_id or str(uuid.uuid4())
+
+        # Get conversation history for this session
+        messages_history = conversation_history.get(f"{session_id}||{tenant_id}", [])
+
+        # Add the new user message to history
+        user_message = HumanMessage(content=request.message)
+        messages_history.append(user_message)
+
+        logger.info(
+            f"Processing multiquery message for tenant: {tenant_id}, session: {session_id}, "
+            f"history length: {len(messages_history)}"
+        )
+
+        # Run the enhanced Multiquery RAG pipeline
+        rag_result = multiquery_graph.invoke(
+            {
+                "messages": messages_history,
+                "question": request.message,
+                "tenant_id": tenant_id,
+            },
+            config={"callbacks": [constants.observability_handler]},
+        )
+
+        # Extract the AI response and additional multiquery data
+        ai_response = rag_result["answer"]
+        generated_queries = rag_result.get("generated_queries", [])
+        query_to_docs_mapping = rag_result.get("query_to_docs_mapping", {})
+
+        # Create retrieval analysis
+        retrieval_analysis = {
+            "total_queries_generated": len(generated_queries),
+            "queries_with_results": len(
+                [q for q, docs in query_to_docs_mapping.items() if docs]
+            ),
+            "retrieval_strategy": "multiquery_with_provenance",
+        }
+
+        # Create detailed retrieval info for each chunk
+        chunk_retrieval_info = []
+        context_docs = rag_result.get("context", [])
+
+        for idx, context_doc in enumerate(context_docs):
+            retrieval_info = RetrievalInfo(
+                chunk_id=idx + 1,
+                source_queries=context_doc.source_queries,
+                retrieval_score=context_doc.retrieval_score,
+                metadata=context_doc.document.metadata,
+            )
+            chunk_retrieval_info.append(retrieval_info)
+
+        # Add AI response to history
+        ai_message = AIMessage(content=ai_response)
+        messages_history.append(ai_message)
+
+        # Update conversation history
+        conversation_history[f"{session_id}||{tenant_id}"] = messages_history
+
+        # Limit history length
+        if len(messages_history) > 20:
+            conversation_history[f"{session_id}||{tenant_id}"] = messages_history[-20:]
+
+        # Extract chunks for response
+        docs = [ctx_doc.document for ctx_doc in context_docs]
+        chunks = [
+            d.page_content if hasattr(d, "page_content") else str(d) for d in docs
+        ]
+
+        return MultiqueryChatMessageResponse(
+            id=str(uuid.uuid4()),
+            session_id=session_id,
+            message=request.message,
+            response=ai_response,
+            timestamp=datetime.now(),
+            chunks=chunks,
+            hallucination_spans=rag_result.get("hallucination_result", {}),
+            retrieved_documents_count=len(docs),
+            generated_queries=generated_queries,
+            retrieval_strategy="multiquery_with_provenance",
+            retrieval_analysis=retrieval_analysis,
+            chunk_retrieval_info=chunk_retrieval_info,
+        )
+
+    except Exception as e:
+        logger.error(f"Error processing multiquery chat message: {e}")
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        tb_lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
+        tb_text = "".join(tb_lines)
+        logger.error(tb_text)
+        raise e
