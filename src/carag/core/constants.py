@@ -25,7 +25,6 @@ if TYPE_CHECKING:
 
 settings = get_settings()
 print("cwd:", os.getcwd())
-print("API key:", repr(settings.OPENAI_API_KEY.get_secret_value()))
 
 _ = Langfuse(
     public_key=settings.LF_PUBLIC_KEY,
@@ -45,8 +44,6 @@ class Constants:
         model=settings.OPENAI_API_MODEL,
         temperature=0.3,
     )
-    print("OPENAI_API_KEY:", repr(settings.OPENAI_API_KEY.get_secret_value()))
-    print("EMBEDDINGS_API_KEY:", repr(settings.EMBEDDINGS_API_KEY.get_secret_value()))
     print("EMBEDDINGS_API_BASE:", repr(settings.EMBEDDINGS_API_BASE))
     print("EMBEDDINGS_API_MODEL:", repr(settings.EMBEDDINGS_API_MODEL))
     embedder: Embeddings = OpenAIEmbeddings(

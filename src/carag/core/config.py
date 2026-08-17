@@ -5,8 +5,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parents[3]
 ENV_FILE = BASE_DIR / ".env"
-print("ENV_FILE =", ENV_FILE)
-print("Exists =", ENV_FILE.exists())
 
 
 class Settings(BaseSettings):
@@ -32,6 +30,8 @@ class Settings(BaseSettings):
     EMBEDDINGS_API_DIMENSION: int = 0
     EMBEDDINGS_API_PORT: int = 0
     EMBEDDINGS_API_GPU_UTIL: float = 0.0
+
+    FRONTEND_URL: str = "http://localhost:5173"
 
     RERANKER_API_KEY: SecretStr = SecretStr("")
     RERANKER_API_BASE: str = ""
@@ -60,12 +60,24 @@ class Settings(BaseSettings):
     REDIS_PORT: int = Field(default=0, validation_alias="RED_PORT")
     REDIS_CHAT_DB: int = Field(default=0, validation_alias="RED_CHAT_DB")
     REDIS_AUTH: str = Field(default="", validation_alias="RED_AUTH")
+    RED_AUTH_DB: int = 3
 
     CELERY_REDIS_DB: int = 2
+
     MONGO_AUTH_PORT: int = 0
     MONGO_AUTH_HOST: str = ""
     MONGO_AUTH_USERNAME: str = ""
     MONGO_AUTH_PASSWD: str = ""
+    MONGO_AUTH_DB: str = "carag_auth"
+    AUTH_SECRET: str
+
+    #GOOGLE OAUTH SETTINGS
+    GOOGLE_CLIENT_ID: str = ""
+    GOOGLE_CLIENT_SECRET: SecretStr = SecretStr("")
+    OAUTH_STATE_SECRET: str
+
+    #callback URL
+    BACKEND_URL: str = "http://localhost:8000"
 
     # CHUNKER SETTINGS
     USE_AGENTIC_TAGGER: bool = False
