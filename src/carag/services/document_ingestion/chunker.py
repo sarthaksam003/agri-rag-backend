@@ -22,6 +22,7 @@ chunker_rules: RecursiveRules = RecursiveRules(
         RecursiveLevel(delimiters=["\n### "], include_delim="next"),
         RecursiveLevel(delimiters=["\n#### "], include_delim="next"),
         RecursiveLevel(delimiters=["\n<table>"], include_delim="next"),
+        RecursiveLevel(delimiters=["\n"], include_delim="next"),
     ]
 )
 
@@ -36,8 +37,9 @@ def count_tokens(tokenizer: Tokenizer, text: str) -> int:
 class CustomChunker:
     def __init__(self) -> None:
         self.tokenizer: Tokenizer = Tokenizer.from_pretrained(
-            settings.EMBEDDINGS_API_MODEL
+            settings.CHUNKER_TOKENIZER_MODEL
         )
+        self.tokenizer.no_truncation()
         self.table_chunker: BaseChunker = TableChunker(
             tokenizer="character",
             chunk_size=settings.CHUNKER_CHUNK_SIZE
@@ -50,7 +52,8 @@ class CustomChunker:
             min_characters_per_chunk=100,
         )
         self.base_chef = MarkdownChef(tokenizer=self.tokenizer)
-        self.custom_table_chef = ContextualMarkdownChef(tokenizer=self.tokenizer)
+        self.custom_table_chef = ContextualMarkdownChef(
+            tokenizer=self.tokenizer)
 
     def chunk(self, markdown: str, metadata: dict[str, Any]) -> list[str]:
         # First parse tables and text with basechef
@@ -183,11 +186,13 @@ class EnhancedChunker:
 
                 enhanced_chunks.append(enhanced_content)
 
-            logger.info(f"Applied agentic tagging to {len(enhanced_chunks)} chunks")
+            logger.info(
+                f"Applied agentic tagging to {len(enhanced_chunks)} chunks")
             return enhanced_chunks
 
         except Exception as e:
-            logger.error(f"Agentic tagging failed, falling back to base chunks: {e}")
+            logger.error(
+                f"Agentic tagging failed, falling back to base chunks: {e}")
             return chunks  # Fallback to original chunks
 
 
@@ -205,6 +210,3 @@ def get_chunker():
 # Keep your existing function
 def get_chunker_original():
     return CustomChunker()
-
-
-custom_table_aware_chunker = CustomChunker()

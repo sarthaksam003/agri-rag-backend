@@ -5,7 +5,7 @@ from typing_extensions import override
 from langchain_core.document_loaders.base import BaseLoader
 from langchain_core.documents import Document
 from markdownify import markdownify as md
-
+from pypdf import PdfReader
 from carag.core.config import get_settings
 from carag.services.document_ingestion.pdfmdconverter import parse_doc_to_markdown
 from carag.services.document_ingestion.utils import (
@@ -34,55 +34,89 @@ class MineruLoader(BaseLoader):
 
     @override
     def lazy_load(self) -> Iterator[Document]:
-        """Lazy load documents by converting PDF to markdown first if needed."""
+        """Load a PDF using MinerU when available, with pypdf fallback."""
+
         file_path = Path(self.file_path)
 
-        # Check if file is PDF
-        if file_path.suffix.lower() == ".pdf":
-            # Use a temporary directory for the conversion process
-            with tempfile.TemporaryDirectory() as temp_dir:
-                try:
-                    # Convert PDF to markdown - this will create the directory structure in temp_dir
-                    parse_doc_to_markdown(
-                        [file_path],
-                        temp_dir,  # This becomes the base output directory
-                        settings.PDFMD_API_BASE,
+        if file_path.suffix.lower() != ".pdf":
+            raise FileNotFoundError("Only PDF Files supported")
+
+        # First try the existing MinerU pipeline.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            try:
+                page_markdowns = parse_doc_to_markdown(
+                    [file_path],
+                    str(output_dir),
+                    server_url,
+                )
+
+                if not page_markdowns:
+                    raise RuntimeError(
+                        f"MinerU returned no page content for {file_path}"
                     )
 
-                    # Find the markdown file based on the expected structure
-                    expected_md_path = self._get_expected_markdown_path(
-                        file_path, Path(temp_dir)
+                for page_data in page_markdowns:
+                    page_number = page_data["page_number"]
+                    page_content = page_data["content"]
+
+                    page_content = fix_markdown_tables(
+                        md(page_content)
                     )
 
-                    if not expected_md_path.exists():
-                        # Try alternative path search if the structure is different
-                        md_files = list(Path(temp_dir).rglob("*.md"))
-                        if md_files:
-                            expected_md_path = md_files[0]
-                        else:
-                            raise FileNotFoundError(
-                                f"Markdown file not found at {expected_md_path}"
-                            )
+                    if not page_content.strip():
+                        continue
 
-                    # Read the entire markdown content
-                    with open(expected_md_path, "r", encoding="utf-8") as f:
-                        content = f.read()
-
-                    fixed_md_text = fix_markdown_tables(md(content))
-
-                    # Yield the entire document as one chunk
                     yield Document(
-                        page_content=fixed_md_text,
+                        page_content=page_content,
                         metadata={
                             "source": str(file_path),
                             "converted_from": "pdf",
                             "file_type": "markdown",
                             "original_pdf": file_path.name,
+                            "page_number": page_number,
                         },
                     )
 
-                except Exception as e:
-                    raise RuntimeError(f"Failed to convert PDF to markdown: {e}") from e
+                return
 
-        else:
-            raise FileNotFoundError("Only PDF Files supported")
+            except Exception as e:
+                # MinerU is GPU-backed and may not be available on the
+                # demonstration machine. Fall back to CPU PDF extraction.
+                print(
+                    f"MinerU conversion unavailable: {e}. "
+                    "Falling back to pypdf."
+                )
+
+        # CPU fallback.
+        reader = PdfReader(str(file_path))
+
+        pages = []
+        has_content = False
+
+        for page_number, page in enumerate(
+            reader.pages,
+            start=1,
+        ):
+            text = page.extract_text() or ""
+
+            if not text.strip():
+                continue
+
+            has_content = True
+
+            yield Document(
+                page_content=text.strip(),
+                metadata={
+                    "source": str(file_path),
+                    "converted_from": "pdf",
+                    "file_type": "text",
+                    "original_pdf": file_path.name,
+                    "page_number": page_number,
+                    "extraction_method": "pypdf",
+                },
+            )
+
+        if not has_content:
+            raise RuntimeError(
+                f"Could not extract any text from PDF: {file_path}"
+            )

@@ -65,7 +65,8 @@ class DocumentIngestionEngine:
                     },
                     hnsw_config=HnswConfigDiff(
                         payload_m=16,  # Enable payload-aware indexing for multitenancy
-                        m=0,  # Disable global index (optimized for tenant queries)
+                        # Disable global index (optimized for tenant queries)
+                        m=0,
                     ),
                 )
 
@@ -82,25 +83,90 @@ class DocumentIngestionEngine:
                     f"Created new multi-tenant optimized collection: {self.collection_name}"
                 )
             else:
-                logger.info(f"Using existing collection: {self.collection_name}")
+                logger.info(
+                    f"Using existing collection: {self.collection_name}")
 
         except Exception as e:
             logger.error(f"Error ensuring collection exists: {e}")
             raise
+    def _pdf_to_markdown_with_pages(
+    self,
+    file_path: str,
+) -> tuple[str, list[dict[str, int]]]:
+        """
+        Convert a PDF to combined markdown while preserving
+        the character boundaries of each source PDF page.
 
-    def _pdf_to_markdown(self, file_path: str) -> str:
+        Returns:
+            markdown_content:
+                The same combined markdown representation used
+                by the existing chunking pipeline.
+
+            page_boundaries:
+                A list containing the start/end offsets and
+                1-based PDF page number for each page.
+        """
+        loader = constants.loader(file_path)
+
+        documents = loader.load()
+
+        parts: list[str] = []
+        page_boundaries: list[dict[str, int]] = []
+
+        cursor = 0
+
+        for document in documents:
+            content = document.page_content
+
+            if not content:
+                continue
+
+            if parts:
+                cursor += 2  # "\n\n" separator
+
+            start = cursor
+
+            parts.append(content)
+
+            cursor += len(content)
+
+            end = cursor
+
+            page_number = document.metadata.get(
+                "page_number"
+            )
+
+            if page_number is not None:
+                page_boundaries.append(
+                    {
+                        "start": start,
+                        "end": end,
+                        "page_number": int(page_number),
+                    }
+                )
+
+        markdown_content = "\n\n".join(parts)
+
+        return markdown_content, page_boundaries        
+    def _pdf_to_markdown(
+    self,
+    file_path: str,
+) -> str:
         """Convert PDF to markdown using MineruLoader."""
         try:
-            loader = constants.loader(file_path)
-            documents = loader.load()
+            markdown_content, _ = (
+                self._pdf_to_markdown_with_pages(
+                    file_path
+                )
+            )
 
-            # Combine all document pages into a single markdown string
-            markdown_content = "\n\n".join([doc.page_content for doc in documents])
             return markdown_content
 
         except Exception as e:
-            logger.error(f"Error converting PDF to markdown for {file_path}: {e}")
-            raise
+            logger.error(
+                f"Error converting PDF to markdown: {e}"
+            )
+            raise    
 
     def _file_already_ingested(self, file_path: str) -> bool:
         """True → same bytes already stored for this tenant."""
@@ -123,35 +189,116 @@ class DocumentIngestionEngine:
         return count > 0
 
     def _chunk_markdown(
-        self, markdown_content: str, metadata: dict[str, Any]
+        self,
+        markdown_content: str,
+        metadata: dict[str, Any],
+        page_boundaries: list[dict[str, int]] | None = None,
     ) -> list[DocumentChunk]:
         """Chunk markdown content using the custom chunker."""
         try:
-            chunks = chunker.chunk(markdown_content, metadata)
+            chunks = chunker.chunk(
+                markdown_content,
+                metadata,
+            )
 
-            document_chunks: list[DocumentChunk] = []
+            document_chunks = []
+
+            search_from = 0
+
             for i, chunk in enumerate(chunks):
-                # Create document chunk with metadata including tenant_id
+
                 chunk_metadata = metadata.copy()
+
                 chunk_metadata.update(
                     {
-                        "tenant_id": self.tenant_id,  # Add tenant_id to metadata
+                        "tenant_id": self.tenant_id,
                         "chunk_index": i,
                         "chunk_id": f"chunk_{i}",
                         "total_chunks": len(chunks),
                     }
                 )
 
-                document_chunk = DocumentChunk(
-                    content=chunk, metadata=chunk_metadata, id=str(uuid4())
-                )
-                document_chunks.append(document_chunk)
+                if page_boundaries:
+                    page_number, search_from = (
+                        self._get_chunk_page_number(
+                            chunk=chunk,
+                            markdown_content=markdown_content,
+                            page_boundaries=page_boundaries,
+                            search_from=search_from,
+                        )
+                    )
 
+                    if page_number is not None:
+                        chunk_metadata["page_number"] = page_number
+
+                document_chunks.append(
+                    DocumentChunk(
+                        content=chunk,
+                        metadata=chunk_metadata,
+                    )
+                )
             return document_chunks
 
         except Exception as e:
             logger.error(f"Error chunking markdown content: {e}")
             raise
+    def _get_chunk_page_number(
+        self,
+        chunk: str,
+        markdown_content: str,
+        page_boundaries: list[dict[str, int]],
+        search_from: int,
+    ) -> tuple[int | None, int]:
+        """
+        Determine the PDF page where a chunk begins.
+
+        Page numbers are 1-based.
+
+        Returns:
+            (page_number, next_search_position)
+        """
+
+        chunk_start = markdown_content.find(
+            chunk,
+            search_from,
+        )
+
+        if chunk_start == -1:
+            # Try a trimmed version in case the chunker
+            # removed leading/trailing whitespace.
+            trimmed_chunk = chunk.strip()
+
+            if trimmed_chunk:
+                chunk_start = markdown_content.find(
+                    trimmed_chunk,
+                    search_from,
+                )
+
+        if chunk_start == -1:
+            logger.warning(
+                "Could not locate chunk in source markdown "
+                "for page-number assignment."
+            )
+
+            return None, search_from
+
+        for boundary in page_boundaries:
+            if (
+                boundary["start"]
+                <= chunk_start
+                < boundary["end"]
+            ):
+                return (
+                    boundary["page_number"],
+                    chunk_start + max(len(chunk), 1),
+                )
+
+        logger.warning(
+            f"Chunk starts at offset {chunk_start}, "
+            "but no PDF page boundary contains it."
+        )
+
+        return None, chunk_start + max(len(chunk), 1)
 
     def _embed_chunks(
         self, document_chunks: list[DocumentChunk]
@@ -163,7 +310,8 @@ class DocumentIngestionEngine:
 
             # Batch embed all texts
             dense_embeddings = constants.embedder.embed_documents(texts)
-            sparse_embeddings = constants.sparse_embedder.embed_documents(texts)
+            sparse_embeddings = constants.sparse_embedder.embed_documents(
+                texts)
 
             # Assign embeddings to chunks
             for chunk, dense_emb, sparse_emb in zip(
@@ -271,12 +419,14 @@ class DocumentIngestionEngine:
             )
 
             # Perform similarity search with tenant filter
-            results = qdrant.similarity_search(query=query, k=k, filter=final_filter)
+            results = qdrant.similarity_search(
+                query=query, k=k, filter=final_filter)
 
             return results
 
         except Exception as e:
-            logger.error(f"Error searching within tenant {self.tenant_id}: {e}")
+            logger.error(
+                f"Error searching within tenant {self.tenant_id}: {e}")
             raise
 
     def search_with_score(
@@ -316,7 +466,8 @@ class DocumentIngestionEngine:
             return results
 
         except Exception as e:
-            logger.error(f"Error searching with score for tenant {self.tenant_id}: {e}")
+            logger.error(
+                f"Error searching with score for tenant {self.tenant_id}: {e}")
             raise
 
     def get_tenant_document_count(self) -> int:
@@ -337,24 +488,23 @@ class DocumentIngestionEngine:
             )
             return 0
 
-    def list_documents(self) -> list[dict[str, str]]:
+
+    def list_documents(self) -> list[dict[str, Any]]:
         """
         Return every distinct document that has been ingested for the current tenant.
-        Each item is a dict with keys:
-            id   – the document_id stored in the chunk metadata
-            filename – the original filename stored in the chunk metadata
         """
         try:
             seen_ids: set[str] = set()
-            docs: list[dict[str, str]] = []
+            docs: list[dict[str, Any]] = []
 
-            # scroll through all points that belong to this tenant
             next_offset = None
+            scroll_limit = 25
+
             while True:
                 page, next_offset = constants.vectorstore.scroll(
                     collection_name=self.collection_name,
                     scroll_filter=self.create_tenant_filter(),
-                    limit=1_000,
+                    limit=scroll_limit,
                     offset=next_offset,
                     with_payload=True,
                     with_vectors=False,
@@ -363,18 +513,28 @@ class DocumentIngestionEngine:
                 for rec in page:
                     meta = rec.payload.get("metadata", {})
                     doc_id = meta.get("document_id")
-                    name = meta.get("original_filename")
+
                     if doc_id and doc_id not in seen_ids:
                         seen_ids.add(doc_id)
-                        docs.append({"id": doc_id, "filename": name or "unknown"})
+                        docs.append(
+                            {
+                                "id": doc_id,
+                                "filename": meta.get("original_filename") or "unknown",
+                                "file_size": meta.get("file_size", 0),
+                                "ingested_at": meta.get("ingested_at"),
+                                "chunk_count": meta.get("total_chunks", 0),
+                            }
+                        )
 
-                if next_offset is None:  # Qdrant signals end of collection
+                if next_offset is None:
                     break
 
             return docs
 
         except Exception as e:
-            logger.error(f"Error listing documents for tenant {self.tenant_id}: {e}")
+            logger.error(
+                f"Error listing documents for tenant {self.tenant_id}: {e}"
+            )
             return []
 
     def ingest_single_document(
@@ -425,8 +585,17 @@ class DocumentIngestionEngine:
             )
 
             # ---- 3.  pdf → markdown → chunks → embeddings → qdrant -------
-            markdown_content = self._pdf_to_markdown(file_path)
-            chunks = self._chunk_markdown(markdown_content, base_metadata)
+            markdown_content, page_boundaries = (
+                self._pdf_to_markdown_with_pages(
+                    file_path
+                )
+            )
+
+            chunks = self._chunk_markdown(
+                markdown_content,
+                base_metadata,
+                page_boundaries,
+            )
             embedded_chunks = self._embed_chunks(chunks)
 
             ingested_doc = IngestedDocument(
@@ -451,7 +620,8 @@ class DocumentIngestionEngine:
                 f"Failed to ingest document {file_path} for tenant {self.tenant_id}: {e}"
             )
             exc_type, exc_value, exc_traceback = sys.exc_info()
-            tb_lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
+            tb_lines = traceback.format_exception(
+                exc_type, exc_value, exc_traceback)
             tb_text = "".join(tb_lines)
             logger.error(tb_text)
             raise e
@@ -466,7 +636,8 @@ class DocumentIngestionEngine:
 
         for file_path in file_paths:
             try:
-                result = self.ingest_single_document(file_path, additional_metadata)
+                result = self.ingest_single_document(
+                    file_path, additional_metadata)
                 results.append(result)
             except Exception as e:
                 logger.error(
@@ -480,7 +651,8 @@ class DocumentIngestionEngine:
     def get_collection_info(self) -> dict[str, Any]:
         """Get information about the current collection."""
         try:
-            collection_info = constants.vectorstore.get_collection(self.collection_name)
+            collection_info = constants.vectorstore.get_collection(
+                self.collection_name)
 
             # Get tenant-specific count
             tenant_count = self.get_tenant_document_count()
@@ -511,7 +683,8 @@ class DocumentIngestionEngine:
             return True
 
         except Exception as e:
-            logger.error(f"Error deleting data for tenant {self.tenant_id}: {e}")
+            logger.error(
+                f"Error deleting data for tenant {self.tenant_id}: {e}")
             return False
 
     def delete_document_chunks(self, chunk_ids: list[str]) -> bool:
@@ -547,7 +720,8 @@ class DocumentIngestionEngine:
             ).count
 
             if existing_count == 0:
-                logger.warning(f"No documents found with document_id: {document_id}")
+                logger.warning(
+                    f"No documents found with document_id: {document_id}")
                 return False, 0
 
             delete_result = constants.vectorstore.delete(
@@ -560,7 +734,8 @@ class DocumentIngestionEngine:
             return True, existing_count
 
         except Exception as e:
-            logger.error(f"Error deleting documents by document_id {document_id}: {e}")
+            logger.error(
+                f"Error deleting documents by document_id {document_id}: {e}")
             return False, 0
 
 

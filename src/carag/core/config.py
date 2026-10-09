@@ -15,6 +15,8 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+    AUTH_SECRET: str = ""
+    
     QDRANT_HOST: str = ""
     QDRANT_PORT: str = ""
     QDRANT_COLLECTION_NAME: str = ""
@@ -33,6 +35,20 @@ class Settings(BaseSettings):
     EMBEDDINGS_API_PORT: int = 0
     EMBEDDINGS_API_GPU_UTIL: float = 0.0
 
+    FRONTEND_URL: str = ""
+    
+    GOOGLE_CLIENT_ID: str = ""
+    GOOGLE_CLIENT_SECRET: SecretStr = SecretStr("")
+    
+    HF_TOKEN: SecretStr = SecretStr("")
+
+
+    OAUTH_STATE_SECRET: str = ""
+
+    BACKEND_URL: str = ""
+    
+    KNOWLEDGE_BASE_TENANT_ID: str = "demo-tenant"
+    
     RERANKER_API_KEY: SecretStr = SecretStr("")
     RERANKER_API_BASE: str = ""
     RERANKER_API_MODEL: str = ""
@@ -48,7 +64,8 @@ class Settings(BaseSettings):
     PDFMD_DATA_TMP: str = ""
 
     CHUNKER_CHUNK_SIZE: int = 0
-
+    CHUNKER_TOKENIZER_MODEL: str = "Snowflake/snowflake-arctic-embed-l-v2.0"
+    
     GUARD_API_BASE: str = ""
     HALLUCINATION_API_BASE: str = ""
 
@@ -60,13 +77,17 @@ class Settings(BaseSettings):
     REDIS_PORT: int = Field(default=0, validation_alias="RED_PORT")
     REDIS_CHAT_DB: int = Field(default=0, validation_alias="RED_CHAT_DB")
     REDIS_AUTH: str = Field(default="", validation_alias="RED_AUTH")
+    RED_AUTH_DB: int = 0
+    RAG_LOCK_TTL_SECONDS: int = 900
+        
+    DOCUMENT_STORAGE_DIR: str = str(BASE_DIR / "data" / "documents")
 
     CELERY_REDIS_DB: int = 2
+    MONGO_AUTH_DB: str = ""
     MONGO_AUTH_PORT: int = 0
     MONGO_AUTH_HOST: str = ""
     MONGO_AUTH_USERNAME: str = ""
     MONGO_AUTH_PASSWD: str = ""
-
     # CHUNKER SETTINGS
     USE_AGENTIC_TAGGER: bool = False
     TABLE_LEN_CHUNK_SIZE_FACTOR: int = 2

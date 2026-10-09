@@ -1,22 +1,41 @@
 from datetime import datetime
-from typing import Any
-
+from typing import Any, Literal
 from pydantic import BaseModel, Field
 
-
+class RagConfigurationUpdate(BaseModel):
+    rag_mode: Literal["simple", "multiquery"]
+    max_queries: int = Field(
+        ge=2,
+        le=6,
+    )
+    
 # Chat Schemas
 class ChatMessageRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=4000)
     session_id: str | None = None
+    source_language: str = Field(default="en")
+    regenerate_from_index: int | None = Field(default=None, ge=0)
+
+class SourceInfo(BaseModel):
+    source: str
+    document_id: str | None = None
+    page_number: int | None = None
+    chunk_id: str | None = None
+    chunk_index: int | None = None
+    content: str
+    relevance_score: float | None = None
+
 
 
 class ChatMessageResponse(BaseModel):
     id: str
     session_id: str
+    session_title: str | None = None
     message: str
     response: str
     timestamp: datetime
     chunks: list[str]
+    sources: list[SourceInfo] = Field(default_factory=list)
     hallucination_spans: dict[str, Any] | None = None
     retrieved_documents_count: int = 0
 
@@ -83,29 +102,29 @@ class SuccessResponse(BaseModel):
     data: dict[str, Any] | None = None
 
 
-class MultiqueryChatMessageRequest(ChatMessageRequest):
-    """Extended request for multiquery RAG with additional options"""
+# class MultiqueryChatMessageRequest(ChatMessageRequest):
+#     """Extended request for multiquery RAG with additional options"""
 
-    use_multiquery: bool = Field(default=True)
-    max_queries: int = Field(default=6, ge=1, le=6)
-
-
-class RetrievalInfo(BaseModel):
-    """Information about how a chunk was retrieved"""
-
-    chunk_id: int
-    source_queries: list[str]
-    retrieval_score: float | None = None
-    metadata: dict[str, Any]
+#     use_multiquery: bool = Field(default=True)
+#     max_queries: int = Field(default=6, ge=1, le=6)
 
 
-class MultiqueryChatMessageResponse(ChatMessageResponse):
-    """Extended response for multiquery RAG"""
+# class RetrievalInfo(BaseModel):
+#     """Information about how a chunk was retrieved"""
 
-    generated_queries: list[str] = Field(default_factory=list)
-    retrieval_strategy: str = "multiquery"
-    retrieval_analysis: dict[str, Any] = Field(default_factory=dict)
-    chunk_retrieval_info: list[RetrievalInfo] = Field(default_factory=list)
+#     chunk_id: int
+#     source_queries: list[str]
+#     retrieval_score: float | None = None
+#     metadata: dict[str, Any]
+
+
+# class MultiqueryChatMessageResponse(ChatMessageResponse):
+#     """Extended response for multiquery RAG"""
+
+#     generated_queries: list[str] = Field(default_factory=list)
+#     retrieval_strategy: str = "multiquery"
+#     retrieval_analysis: dict[str, Any] = Field(default_factory=dict)
+#     chunk_retrieval_info: list[RetrievalInfo] = Field(default_factory=list)
 
 
 # Voice Chat Schemas
@@ -121,8 +140,10 @@ class VoiceChatRequest(BaseModel):
 class VoiceChatResponse(BaseModel):
     id: str
     session_id: str
+    session_title: str | None = None
     original_message: str  # what ASR heard (in source language)
-    translated_message: str | None  # translated to RAG language (if applicable)
+    # translated to RAG language (if applicable)
+    translated_message: str | None
     response: str  # RAG response (in RAG language)
     translated_response: (
         str | None
@@ -133,9 +154,12 @@ class VoiceChatResponse(BaseModel):
     hallucination_spans: dict[str, Any] | None = None
     retrieved_documents_count: int = 0
 
-
+class TranscriptionResponse(BaseModel):
+    text: str
+    source_language: str
+    
 # TTS Schemas
 class TTSRequest(BaseModel):
-    text: str = Field(..., min_length=1, max_length=5000)
+    text: str = Field(..., min_length=1)
     language: str = Field(default="hi")
     gender: str = Field(default="female")

@@ -35,7 +35,75 @@ Take your time and respond with absolute precision.
 
 
 Remember: Quality over quantity. A precise, accurate answer is better than a lengthy but uncertain one.
+**RESPONSE FORMATTING GUIDELINES:**
+1. Use standard Markdown formatting whenever it improves the clarity and readability of the response. Do not add formatting unnecessarily.
 
+2. Use Markdown headings (`#`, `##`, `###`, etc.) to organize longer responses into clear sections and subsections.
+
+3. Do not repeat, restate, or paraphrase the user's question as a heading or introductory sentence. Begin directly with the answer. Use headings only for genuinely distinct sections within the answer.
+
+4. Use **bold** text to emphasize important terms, conclusions, key values, or concepts when appropriate.
+
+5. Use *italic* text for appropriate emphasis, terminology, or secondary emphasis when appropriate.
+
+6. Use ordered lists (`1.`, `2.`, `3.`, etc.) when presenting steps, sequences, rankings, or other ordered information.
+
+7. Use unordered lists (`-` or `*`) when presenting multiple related items that do not have a required order.
+
+8. Use nested lists when information contains multiple levels of related points.
+
+9. Use Markdown tables when presenting structured information that is naturally suited to rows and columns. Ensure that table values are accurate and clearly aligned with the source material.
+
+10. Use blockquotes (`>`) when quoting or highlighting relevant information from the provided content. Do not fabricate quotations.
+
+11. Use inline code (backticks) for code elements, variable names, function names, commands, file names, paths, configuration values, identifiers, or other literal technical values when appropriate.
+
+12. Use fenced code blocks with triple backticks for multi-line code, configuration, commands, structured data, or other content that should preserve its formatting. Specify the language after the opening backticks when the language is known.
+
+13. Use horizontal rules (`---`) sparingly to separate major sections when appropriate.
+
+14. Use standard Markdown links when a relevant URL is explicitly available in the provided content. Do not invent URLs.
+
+15. Use Markdown strikethrough (`~~text~~`) only when the meaning genuinely requires indicating removed, superseded, or incorrect text.
+
+16. When presenting mathematical expressions, equations, formulas, variables, or mathematical notation, use LaTeX enclosed in Markdown math delimiters so that it can be rendered correctly.
+
+17. Use inline math delimiters `$ ... $` for mathematical expressions that appear within normal sentences.
+
+18. Use display math delimiters `$$ ... $$` for equations or mathematical expressions that should appear on their own line.
+
+19. Do not output raw or bare LaTeX commands such as `\text{{}}`, `\frac{{}}{{}}`, `\sum{{}}`, `\sqrt{{}}`, subscripts, superscripts, Greek letters, or other LaTeX notation as ordinary text when they are intended to represent mathematics. Enclose the complete mathematical expression in the appropriate math delimiters.
+
+20. When displaying multiple mathematical expressions, keep related equations together in a readable mathematical block and use appropriate LaTeX notation rather than attempting to reproduce mathematical formatting with ordinary text.
+
+21. Escape Markdown special characters when they are intended to appear literally rather than act as Markdown syntax.
+
+22. Preserve the exact factual meaning of the provided content while applying formatting. Formatting must never alter, omit, invent, or reinterpret information.
+
+23. Preserve all required `[CHUNK_ID]` citations exactly as specified by the citation rules above. Do not place Markdown formatting around a citation in a way that changes its required citation format.
+
+24. Prefer clear, readable formatting over excessive formatting. Do not turn every sentence into a separate heading, list item, bold phrase, table, or mathematical expression.
+
+25. Do not use HTML tags for formatting when equivalent Markdown formatting is available.
+
+26. Do not use unsupported or unnecessary formatting syntax merely for visual effect.
+
+---------------------
+
+RESPONSE LANGUAGE:
+The user's selected response language is: {response_language}
+
+You MUST write the entire answer in this language.
+
+Language codes:
+- en = English
+- hi = Hindi
+- kn = Kannada
+- ta = Tamil
+- te = Telugu
+
+Do not answer in English when the selected response language is Hindi, Kannada, or Tamil.
+Keep factual information, numbers, citations such as [1], chemical names, scientific names, product names, and technical terms accurate. You may retain a technical term in English when translating it would reduce clarity, but the surrounding explanation must be in the requested language.
 ---------------------
 
 CONVERSATION HISTORY SO FAR:
@@ -105,6 +173,21 @@ RESPONSE GUIDELINES:
 - If a chunk was retrieved by the original query, it's directly relevant
 - If a chunk was retrieved by related queries, it may provide complementary information
 - Chunks from multiple queries should be synthesized to give a comprehensive answer
+
+RESPONSE LANGUAGE:
+The user's selected response language is: {response_language}
+
+You MUST write the entire answer in this language.
+
+Language codes:
+- en = English
+- hi = Hindi
+- kn = Kannada
+- ta = Tamil
+- te = Telugu
+
+Do not answer in English when the selected response language is Hindi, Kannada, or Tamil.
+Keep factual information, numbers, citations such as [1], chemical names, scientific names, product names, and technical terms accurate. You may retain a technical term in English when translating it would reduce clarity, but the surrounding explanation must be in the requested language.
 
 CONVERSATION HISTORY:
 {conversation_history}

@@ -25,3 +25,17 @@ def get_ingestion_engine(tenant_id: str):
     from carag.services.document_ingestion.ingest import get_ingestion_engine
 
     return get_ingestion_engine(tenant_id=tenant_id)
+
+
+def get_knowledge_base_tenant_id() -> str:
+    """
+    Return the server-controlled tenant ID used by the shared
+    application knowledge base.
+    """
+    if not settings.KNOWLEDGE_BASE_TENANT_ID:
+        raise HTTPException(
+            status_code=500,
+            detail="Knowledge base tenant ID is not configured",
+        )
+
+    return settings.KNOWLEDGE_BASE_TENANT_ID

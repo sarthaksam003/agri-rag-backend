@@ -7,12 +7,12 @@ import redis
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
 from langchain_qdrant import FastEmbedSparse
 from langfuse import Langfuse, get_client
 from langfuse.langchain import CallbackHandler
 from qdrant_client import QdrantClient
-
+from carag.services.rag_engine.hf_embeddings import HuggingFaceEmbeddings
 from carag.core.config import get_settings
 
 # from carag.services.document_ingestion.chunker import (
@@ -25,7 +25,6 @@ if TYPE_CHECKING:
 
 settings = get_settings()
 print("cwd:", os.getcwd())
-print("API key:", repr(settings.OPENAI_API_KEY.get_secret_value()))
 
 _ = Langfuse(
     public_key=settings.LF_PUBLIC_KEY,
@@ -45,21 +44,28 @@ class Constants:
         model=settings.OPENAI_API_MODEL,
         temperature=0.3,
     )
-    print("OPENAI_API_KEY:", repr(settings.OPENAI_API_KEY.get_secret_value()))
-    print("EMBEDDINGS_API_KEY:", repr(settings.EMBEDDINGS_API_KEY.get_secret_value()))
+    print("EMBEDDINGS_API_KEY:", repr(
+        settings.EMBEDDINGS_API_KEY.get_secret_value()))
     print("EMBEDDINGS_API_BASE:", repr(settings.EMBEDDINGS_API_BASE))
     print("EMBEDDINGS_API_MODEL:", repr(settings.EMBEDDINGS_API_MODEL))
-    embedder: Embeddings = OpenAIEmbeddings(
-        base_url=settings.EMBEDDINGS_API_BASE,
-        api_key=settings.EMBEDDINGS_API_KEY.get_secret_value(),
+    embedder: Embeddings = HuggingFaceEmbeddings(
         model=settings.EMBEDDINGS_API_MODEL,
+        api_key=settings.HF_TOKEN.get_secret_value(),
     )
 
-    from carag.services.rag_engine.rerank import VllmRerank
+    # from carag.services.rag_engine.rerank import VllmRerank
 
-    reranker: VllmRerank = VllmRerank(
+    # reranker: VllmRerank = VllmRerank(
+    #     base_url=settings.RERANKER_API_BASE,
+    #     api_key=settings.RERANKER_API_KEY.get_secret_value(),
+    #     model=settings.RERANKER_API_MODEL,
+    #     top_n=5,
+    # )
+    from carag.services.rag_engine.rerank import MixedbreadRerank
+
+    reranker: MixedbreadRerank = MixedbreadRerank(
         base_url=settings.RERANKER_API_BASE,
-        api_key=settings.RERANKER_API_KEY.get_secret_value(),
+        api_key=settings.RERANKER_API_KEY,
         model=settings.RERANKER_API_MODEL,
         top_n=5,
     )

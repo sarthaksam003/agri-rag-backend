@@ -53,14 +53,34 @@ def parse_doc_to_markdown(
 
         logger.debug(f"Applying titler to: {pdf_file_name}")
         pdf_info = titler.llm_aided_title(pdf_info_tmp)
-
         image_dir = os.path.basename(local_image_dir)
+        page_markdowns = []
+        for page_info in pdf_info:
+            page_idx = page_info.get("page_idx")
+
+            if page_idx is None:
+                continue
+
+            page_markdown = vlm_union_make(
+                [page_info],
+                MakeMode.MM_MD,
+                image_dir=os.path.basename(local_image_dir),
+            )
+
+            page_markdowns.append(
+                {
+                    "page_number": page_idx + 1,
+                    "content": page_markdown,
+                }
+            )
+        
         md_content = vlm_union_make(pdf_info, MakeMode.MM_MD, image_dir)
 
         # Write markdown file
         md_writer.write_string(f"{pdf_file_name}.md", md_content)
 
         logger.info(f"Markdown generated: {local_md_dir}/{pdf_file_name}.md")
+        return page_markdowns
 
 
 if __name__ == "__main__":

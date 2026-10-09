@@ -2,12 +2,16 @@ import asyncio
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-
+import shutil
 from celery.result import AsyncResult
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from loguru import logger
-
-from carag.api.dependencies import get_ingestion_engine, get_tenant_id
+from fastapi.responses import FileResponse
+from pathlib import Path
+from carag.api.dependencies import (
+    get_ingestion_engine,
+    get_knowledge_base_tenant_id,
+)
 from carag.api.schemas import (
     BatchDocumentIngestionResponse,
     DeleteDocumentResponse,
@@ -17,8 +21,11 @@ from carag.api.schemas import (
     SuccessResponse,
 )
 from carag.worker import celery_app
-from carag.worker.tasks import ingest_document
+from carag.core.config import get_settings
+from carag.auth.dependencies import require_admin
+from carag.auth.models import User
 
+settings = get_settings()
 router = APIRouter()
 _pool = ThreadPoolExecutor(max_workers=4)
 
@@ -34,24 +41,40 @@ async def get_job_status(job_id: str):
     try:
         res = AsyncResult(job_id, app=celery_app)
 
-        if res.result is None and res.state == "PENDING":
-            try:
-                res.get(timeout=0.1)
-            except Exception:
-                return {
-                    "job_id": job_id,
-                    "status": "not_found",
-                    "error": "Job does not exist",
-                }
         if res.state == "PENDING":
-            return {"job_id": job_id, "status": "processing"}
-        elif res.state == "SUCCESS":
-            return {"job_id": job_id, **res.result}
-        else:  # FAILURE
-            return {"job_id": job_id, "status": "failed", "error": str(res.info)}
+            return {
+                "job_id": job_id,
+                "status": "processing",
+            }
+
+        if res.state == "SUCCESS":
+            return {
+                "job_id": job_id,
+                **res.result,
+            }
+
+        if res.state == "FAILURE":
+            return {
+                "job_id": job_id,
+                "status": "failed",
+                "error": str(res.info),
+            }
+
+        return {
+            "job_id": job_id,
+            "status": res.state.lower(),
+        }
+
     except Exception as e:
-        logger.error(f"Error checking job status {job_id}: {e}")
-        return {"job_id": job_id, "status": "error", "error": str(e)}
+        logger.error(
+            f"Error checking job status {job_id}: {e}"
+        )
+
+        return {
+            "job_id": job_id,
+            "status": "error",
+            "error": str(e),
+        }
 
 
 @router.post(
@@ -61,9 +84,9 @@ async def get_job_status(job_id: str):
     responses={400: {"model": ErrorResponse}},
 )
 async def ingest_documents(
-    background: BackgroundTasks,
+    _: User = Depends(require_admin),
     files: list[UploadFile] = File(...),
-    tenant_id: str = Depends(get_tenant_id),
+    tenant_id: str = Depends(get_knowledge_base_tenant_id),
 ) -> BatchDocumentIngestionResponse:
     """
     Accepts PDFs, creates a job per file, returns immediately.
@@ -74,10 +97,25 @@ async def ingest_documents(
     processed_files = []
     for file in files:
         if not file.filename.lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail=f"{file.filename} is not a PDF")
+            raise HTTPException(
+                status_code=400, detail=f"{file.filename} is not a PDF")
 
         document_id = str(uuid.uuid4())
-        blob = await file.read()
+        storage_dir = (
+            Path(settings.DOCUMENT_STORAGE_DIR).resolve()
+            / tenant_id
+        )
+        storage_dir.mkdir(parents=True, exist_ok=True)
+
+        document_path = (
+            storage_dir
+            / f"{document_id}.pdf"
+        ).resolve()
+
+        with document_path.open("wb") as output:
+            while chunk := await file.read(1024 * 1024):
+                output.write(chunk)
+
         meta = {
             "document_id": document_id,
             "original_filename": file.filename,
@@ -85,8 +123,17 @@ async def ingest_documents(
             "tenant_id": tenant_id,
         }
 
-        # Fire-and-forget Celery task
-        task = ingest_document.delay(tenant_id, file.filename, blob, meta)
+        from carag.worker.tasks import ingest_document
+        # print("DEBUG document_path:", document_path)
+        # print("DEBUG absolute:", document_path.is_absolute())
+        # print("DEBUG exists:", document_path.exists())
+        # print("DEBUG documents.py:", __file__)
+        task = ingest_document.delay(
+            tenant_id,
+            file.filename,
+            str(document_path),
+            meta,
+        )
 
         processed_files.append(
             DocumentIngestionResponse(
@@ -110,7 +157,8 @@ async def ingest_documents(
     responses={500: {"model": ErrorResponse}},
 )
 async def list_ingested_documents(
-    tenant_id: str = Depends(get_tenant_id),
+    _: User = Depends(require_admin),
+    tenant_id: str = Depends(get_knowledge_base_tenant_id),
 ) -> SuccessResponse:
     """
     List all ingested documents for the current tenant.
@@ -138,29 +186,94 @@ async def list_ingested_documents(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get(
+    "/{document_id}/file",
+    response_class=FileResponse,
+    responses={
+        404: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
+)
+async def get_document_file(
+
+    document_id: str,
+    _: User = Depends(require_admin),
+    tenant_id: str = Depends(get_knowledge_base_tenant_id),
+):
+    """
+    Return the persisted PDF for a document belonging to the current tenant.
+    """
+    try:
+        document_path = (
+            Path(settings.DOCUMENT_STORAGE_DIR).resolve()
+            / tenant_id
+            / f"{document_id}.pdf"
+        ).resolve()
+
+        if not document_path.is_file():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Document file {document_id} not found",
+            )
+
+        return FileResponse(
+            path=document_path,
+            media_type="application/pdf",
+            filename=f"{document_id}.pdf",
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error serving document {document_id}: {e}"
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        )
+
+
 @router.delete(
     "/{document_id}",
     response_model=DeleteDocumentResponse,
-    responses={404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+    responses={
+        404: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
 )
 async def delete_document(
     document_id: str,
-    tenant_id: str = Depends(get_tenant_id),
+    _: User = Depends(require_admin),
+    tenant_id: str = Depends(get_knowledge_base_tenant_id),
 ) -> DeleteDocumentResponse:
     """
-    Delete a specific document and all its chunks for the current tenant.
+    Delete a specific document, its chunks, and its persisted PDF
+    for the current tenant.
     """
     try:
         ingestion_engine = get_ingestion_engine(tenant_id)
 
-        success, deleted_chunks = ingestion_engine.delete_documents_by_document_id(
-            document_id
+        success, deleted_chunks = (
+            ingestion_engine.delete_documents_by_document_id(
+                document_id
+            )
         )
 
         if not success or deleted_chunks == 0:
             raise HTTPException(
-                status_code=404, detail=f"Document {document_id} not found"
+                status_code=404,
+                detail=f"Document {document_id} not found",
             )
+
+        document_path = (
+            Path(settings.DOCUMENT_STORAGE_DIR).resolve()
+            / tenant_id
+            / f"{document_id}.pdf"
+        ).resolve()
+
+        if document_path.is_file():
+            document_path.unlink()
 
         return DeleteDocumentResponse(
             message=f"Document {document_id} deleted successfully",
@@ -171,8 +284,13 @@ async def delete_document(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error deleting document {document_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            f"Error deleting document {document_id}: {e}"
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        )
 
 
 @router.delete(
@@ -181,32 +299,78 @@ async def delete_document(
     responses={500: {"model": ErrorResponse}},
 )
 async def delete_all_tenant_documents(
-    tenant_id: str = Depends(get_tenant_id),
+    _: User = Depends(require_admin),
+    tenant_id: str = Depends(get_knowledge_base_tenant_id),
 ) -> DeleteTenantResponse:
     """
-    Delete ALL documents and chunks for the current tenant.
+    Delete ALL documents, chunks, and persisted PDF files
+    for the current tenant.
     Use with caution - this action cannot be undone.
     """
     try:
         ingestion_engine = get_ingestion_engine(tenant_id)
 
-        # Get current count before deletion
-        before_count = ingestion_engine.get_tenant_document_count()
+        # Get current chunk count before deletion
+        before_count = (
+            ingestion_engine.get_tenant_document_count()
+        )
 
-        # Delete all tenant data
+        # Delete all Qdrant tenant data
         success = ingestion_engine.delete_tenant_data()
 
         if not success:
-            raise HTTPException(status_code=500, detail="Failed to delete tenant data")
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to delete tenant data",
+            )
 
-        deleted_chunks = before_count
+        # Delete all persisted PDFs for this tenant
+        storage_dir = (
+            Path(settings.DOCUMENT_STORAGE_DIR).resolve()
+            / tenant_id
+        ).resolve()
+
+        if storage_dir.is_dir():
+            for document_path in storage_dir.glob("*.pdf"):
+                try:
+                    document_path.unlink()
+                except OSError as e:
+                    logger.error(
+                        f"Failed to delete stored document "
+                        f"{document_path}: {e}"
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            f"Failed to delete stored document "
+                            f"{document_path.name}"
+                        ),
+                    )
+
+            # Remove the tenant directory if it is now empty
+            try:
+                storage_dir.rmdir()
+            except OSError:
+                # Directory may contain unrelated files; leave it in place.
+                pass
 
         return DeleteTenantResponse(
-            message=f"All documents for tenant {tenant_id} deleted successfully",
-            deleted_chunks=deleted_chunks,
+            message=(
+                f"All documents for tenant {tenant_id} "
+                "deleted successfully"
+            ),
+            deleted_chunks=before_count,
             tenant_id=tenant_id,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error deleting all documents for tenant {tenant_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            f"Error deleting all documents for tenant "
+            f"{tenant_id}: {e}"
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        )

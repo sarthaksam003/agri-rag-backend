@@ -59,6 +59,12 @@ async def _get_pipeline_config(
             json=payload,
             headers=headers,
         )
+
+        print("\n===== BHASHINI PIPELINE RESPONSE =====")
+        print("Status:", response.status_code)
+        print("Body:", response.text)
+        print("======================================\n")
+
         response.raise_for_status()
         data = response.json()
 
@@ -113,11 +119,27 @@ async def call_inference(
     if config.inference_api_key:
         headers["Authorization"] = config.inference_api_key
 
+    # async with httpx.AsyncClient(timeout=60) as client:
+    #     response = await client.post(
+    #         config.callback_url,
+    #         json=payload,
+    #         headers=headers,
+    #     )
+    #     response.raise_for_status()
+    #     return response.json()
     async with httpx.AsyncClient(timeout=60) as client:
         response = await client.post(
             config.callback_url,
             json=payload,
             headers=headers,
         )
+
+        if response.status_code >= 400:
+            logger.error(
+                "Bhashini inference failed: "
+                f"status={response.status_code}, "
+                f"body={response.text}"
+            )
+
         response.raise_for_status()
         return response.json()
