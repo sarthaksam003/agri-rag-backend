@@ -112,9 +112,19 @@ async def ingest_documents(
             / f"{document_id}.pdf"
         ).resolve()
 
-        with document_path.open("wb") as output:
-            while chunk := await file.read(1024 * 1024):
-                output.write(chunk)
+        try:
+            with document_path.open("wb") as output:
+                while chunk := await file.read(1024 * 1024):
+                    output.write(chunk)
+        except Exception:
+            # Do not leave a partial PDF if persistence itself fails.
+            try:
+                document_path.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                logger.error(
+                    f"Could not remove incomplete upload {document_path}: {cleanup_error}"
+                )
+            raise
 
         meta = {
             "document_id": document_id,
@@ -128,12 +138,23 @@ async def ingest_documents(
         # print("DEBUG absolute:", document_path.is_absolute())
         # print("DEBUG exists:", document_path.exists())
         # print("DEBUG documents.py:", __file__)
-        task = ingest_document.delay(
-            tenant_id,
-            file.filename,
-            str(document_path),
-            meta,
-        )
+        try:
+            task = ingest_document.delay(
+                tenant_id,
+                file.filename,
+                str(document_path),
+                meta,
+            )
+        except Exception:
+            # The API persisted the PDF, but no worker accepted the job.
+            # Remove this orphaned upload and let the request fail visibly.
+            try:
+                document_path.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                logger.error(
+                    f"Could not remove unqueued upload {document_path}: {cleanup_error}"
+                )
+            raise
 
         processed_files.append(
             DocumentIngestionResponse(
@@ -252,27 +273,27 @@ async def delete_document(
     for the current tenant.
     """
     try:
-        ingestion_engine = get_ingestion_engine(tenant_id)
-
-        success, deleted_chunks = (
-            ingestion_engine.delete_documents_by_document_id(
-                document_id
-            )
-        )
-
-        if not success or deleted_chunks == 0:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Document {document_id} not found",
-            )
-
         document_path = (
             Path(settings.DOCUMENT_STORAGE_DIR).resolve()
             / tenant_id
             / f"{document_id}.pdf"
         ).resolve()
+        stored_file_exists = document_path.is_file()
 
-        if document_path.is_file():
+        ingestion_engine = get_ingestion_engine(tenant_id)
+        success, deleted_chunks = (
+            ingestion_engine.delete_documents_by_document_id(document_id)
+        )
+
+        # A failed ingestion can leave a retained source PDF but no Qdrant
+        # points. Allow admins to remove that file through the same endpoint.
+        if not success and not stored_file_exists:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Document {document_id} not found",
+            )
+
+        if stored_file_exists:
             document_path.unlink()
 
         return DeleteDocumentResponse(

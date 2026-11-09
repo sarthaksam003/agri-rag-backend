@@ -44,13 +44,8 @@ class Constants:
         model=settings.OPENAI_API_MODEL,
         temperature=0.3,
     )
-    print("EMBEDDINGS_API_KEY:", repr(
-        settings.EMBEDDINGS_API_KEY.get_secret_value()))
-    print("EMBEDDINGS_API_BASE:", repr(settings.EMBEDDINGS_API_BASE))
-    print("EMBEDDINGS_API_MODEL:", repr(settings.EMBEDDINGS_API_MODEL))
     embedder: Embeddings = HuggingFaceEmbeddings(
         model=settings.EMBEDDINGS_API_MODEL,
-        api_key=settings.HF_TOKEN.get_secret_value(),
     )
 
     # from carag.services.rag_engine.rerank import VllmRerank
@@ -75,6 +70,7 @@ class Constants:
 
     sparse_embedder: FastEmbedSparse = FastEmbedSparse(
         model_name="Qdrant/bm25",
+        batch_size=32,
         cache_dir=os.path.expanduser("~/.cache/huggingface/hub"),
     )
 

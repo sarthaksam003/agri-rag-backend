@@ -1,4 +1,5 @@
 import hashlib
+import math
 import os
 import sys
 import time
@@ -18,15 +19,19 @@ from qdrant_client.models import (
     HnswConfigDiff,
     KeywordIndexParams,
     MatchValue,
+    PointStruct,
     SparseIndexParams,
+    SparseVector as QdrantSparseVector,
     SparseVectorParams,
     VectorParams,
 )
-
 from carag.core.config import get_settings
 from carag.core.constants import get_constants
 from carag.services.document_ingestion.chunker import get_chunker
-from carag.services.document_ingestion.models import DocumentChunk, IngestedDocument
+from carag.services.document_ingestion.models import (
+    DocumentChunk,
+    IngestedDocument,
+)
 
 settings = get_settings()
 constants = get_constants()
@@ -89,10 +94,11 @@ class DocumentIngestionEngine:
         except Exception as e:
             logger.error(f"Error ensuring collection exists: {e}")
             raise
+
     def _pdf_to_markdown_with_pages(
-    self,
-    file_path: str,
-) -> tuple[str, list[dict[str, int]]]:
+        self,
+        file_path: str,
+    ) -> tuple[str, list[dict[str, int]]]:
         """
         Convert a PDF to combined markdown while preserving
         the character boundaries of each source PDF page.
@@ -147,11 +153,12 @@ class DocumentIngestionEngine:
 
         markdown_content = "\n\n".join(parts)
 
-        return markdown_content, page_boundaries        
+        return markdown_content, page_boundaries
+
     def _pdf_to_markdown(
-    self,
-    file_path: str,
-) -> str:
+        self,
+        file_path: str,
+    ) -> str:
         """Convert PDF to markdown using MineruLoader."""
         try:
             markdown_content, _ = (
@@ -166,7 +173,7 @@ class DocumentIngestionEngine:
             logger.error(
                 f"Error converting PDF to markdown: {e}"
             )
-            raise    
+            raise
 
     def _file_already_ingested(self, file_path: str) -> bool:
         """True → same bytes already stored for this tenant."""
@@ -242,6 +249,7 @@ class DocumentIngestionEngine:
         except Exception as e:
             logger.error(f"Error chunking markdown content: {e}")
             raise
+
     def _get_chunk_page_number(
         self,
         chunk: str,
@@ -303,21 +311,60 @@ class DocumentIngestionEngine:
     def _embed_chunks(
         self, document_chunks: list[DocumentChunk]
     ) -> list[DocumentChunk]:
-        """Embed document chunks using the embedder."""
+        """Embed every chunk and reject incomplete or invalid embedding batches."""
         try:
-            # Extract texts for batch embedding
-            texts = [chunk.content for chunk in document_chunks]
+            if not document_chunks:
+                raise ValueError(
+                    "Document produced no chunks; refusing to ingest it.")
 
-            # Batch embed all texts
+            texts = [chunk.content for chunk in document_chunks]
             dense_embeddings = constants.embedder.embed_documents(texts)
             sparse_embeddings = constants.sparse_embedder.embed_documents(
                 texts)
 
-            # Assign embeddings to chunks
-            for chunk, dense_emb, sparse_emb in zip(
-                document_chunks, dense_embeddings, sparse_embeddings
+            expected = len(document_chunks)
+            if len(dense_embeddings) != expected:
+                raise RuntimeError(
+                    f"Dense embedder returned {len(dense_embeddings)} embeddings "
+                    f"for {expected} chunks."
+                )
+            if len(sparse_embeddings) != expected:
+                raise RuntimeError(
+                    f"Sparse embedder returned {len(sparse_embeddings)} embeddings "
+                    f"for {expected} chunks."
+                )
+
+            expected_dimension = int(settings.EMBEDDINGS_API_DIMENSION)
+            for index, (chunk, dense_emb, sparse_emb) in enumerate(
+                zip(document_chunks, dense_embeddings, sparse_embeddings)
             ):
-                chunk.embedding = dense_emb  # Dense embedding
+                if dense_emb is None or len(dense_emb) != expected_dimension:
+                    raise ValueError(
+                        f"Invalid dense embedding for chunk {index}: expected "
+                        f"{expected_dimension} values, got "
+                        f"{0 if dense_emb is None else len(dense_emb)}."
+                    )
+                if not all(math.isfinite(float(value)) for value in dense_emb):
+                    raise ValueError(
+                        f"Dense embedding for chunk {index} contains non-finite values.")
+
+                if sparse_emb is None:
+                    raise ValueError(
+                        f"Sparse embedding for chunk {index} is missing.")
+                sparse_indices = getattr(sparse_emb, "indices", None)
+                sparse_values = getattr(sparse_emb, "values", None)
+                if (
+                    not sparse_indices
+                    or not sparse_values
+                    or len(sparse_indices) != len(sparse_values)
+                ):
+                    raise ValueError(
+                        f"Sparse embedding for chunk {index} is empty or malformed.")
+                if not all(math.isfinite(float(value)) for value in sparse_values):
+                    raise ValueError(
+                        f"Sparse embedding for chunk {index} contains non-finite values.")
+
+                chunk.embedding = list(dense_emb)
                 chunk.sparse_embedding = sparse_emb
 
             return document_chunks
@@ -326,56 +373,165 @@ class DocumentIngestionEngine:
             logger.error(f"Error embedding chunks: {e}")
             raise
 
+    def _document_filter(self, document_id: str) -> Filter:
+        """Filter Qdrant points belonging to one tenant-scoped document."""
+        return Filter(
+            must=[
+                FieldCondition(
+                    key="metadata.tenant_id",
+                    match=MatchValue(value=self.tenant_id),
+                ),
+                FieldCondition(
+                    key="metadata.document_id",
+                    match=MatchValue(value=document_id),
+                ),
+            ]
+        )
+
+    def _count_document_points(self, document_id: str) -> int:
+        return constants.vectorstore.count(
+            collection_name=self.collection_name,
+            count_filter=self._document_filter(document_id),
+            exact=True,
+        ).count
+
+    def _remove_partial_document(self, document_id: str) -> None:
+        """Remove and verify all points for a failed ingestion attempt."""
+        document_filter = self._document_filter(document_id)
+        constants.vectorstore.delete(
+            collection_name=self.collection_name,
+            points_selector=document_filter,
+            wait=True,
+        )
+        remaining = self._count_document_points(document_id)
+        if remaining:
+            raise RuntimeError(
+                f"Cleanup left {remaining} Qdrant points for document {document_id}."
+            )
+
     def _store_in_qdrant(
         self,
         ingested_document: IngestedDocument,
         retrieval_mode: RetrievalMode = RetrievalMode.HYBRID,
     ) -> None:
-        """Store document chunks in Qdrant vector store with tenant isolation."""
-        try:
-            # Convert to LangChain documents for Qdrant integration
-            langchain_documents: list[Document] = []
-            metadatas: list[dict[str, Any]] = []
-            ids: list[str] = []
+        """Store precomputed chunk embeddings and verify the complete document."""
+        document_id = ingested_document.metadata.get("document_id")
+        if not document_id:
+            raise ValueError("document_id is required in ingestion metadata.")
 
-            for chunk in ingested_document.chunks:
-                if chunk.embedding is None or chunk.sparse_embedding is None:
-                    logger.warning(
-                        f"Warning: Empty embeddings recieved for the chunk:\n{chunk}"
-                    )
-                    continue
+        chunks = ingested_document.chunks
+        expected_count = len(chunks)
 
-                # Ensure tenant_id is in metadata
-                if "tenant_id" not in chunk.metadata:
-                    chunk.metadata["tenant_id"] = self.tenant_id
+        if expected_count == 0:
+            raise ValueError("Cannot store a document with zero chunks.")
 
-                # Create LangChain document
-                langchain_doc = Document(
-                    page_content=chunk.content, metadata=chunk.metadata
-                )
-                langchain_documents.append(langchain_doc)
-                metadatas.append(chunk.metadata)
-                ids.append(chunk.id)
-
-            # Use LangChain's Qdrant integration for storage with tenant isolation
-            vector_store = QdrantVectorStore(
-                client=constants.vectorstore,
-                collection_name=self.collection_name,
-                embedding=constants.embedder,
-                sparse_embedding=constants.sparse_embedder,
-                retrieval_mode=retrieval_mode,
-                vector_name="dense",
-                sparse_vector_name="sparse",
+        existing_count = self._count_document_points(str(document_id))
+        if existing_count:
+            raise FileExistsError(
+                f"Document ID {document_id} already has {existing_count} Qdrant points."
             )
-            # Add documents to Qdrant
-            vector_store.add_documents(documents=langchain_documents, ids=ids)
+
+        batch_size = 32
+
+        try:
+            for index, chunk in enumerate(chunks):
+                if chunk.embedding is None or chunk.sparse_embedding is None:
+                    raise ValueError(
+                        f"Chunk {index} is missing a dense or sparse embedding."
+                    )
+
+                if len(chunk.embedding) != int(settings.EMBEDDINGS_API_DIMENSION):
+                    raise ValueError(
+                        f"Chunk {index} has an invalid dense embedding dimension."
+                    )
+
+                if (
+                    not chunk.sparse_embedding.indices
+                    or not chunk.sparse_embedding.values
+                    or len(chunk.sparse_embedding.indices)
+                    != len(chunk.sparse_embedding.values)
+                ):
+                    raise ValueError(
+                        f"Chunk {index} has an invalid sparse embedding."
+                    )
+
+                chunk.metadata["tenant_id"] = self.tenant_id
+
+            for start in range(0, expected_count, batch_size):
+                batch_chunks = chunks[start: start + batch_size]
+                points = []
+
+                for chunk in batch_chunks:
+                    vectors = {}
+
+                    if retrieval_mode in (
+                        RetrievalMode.DENSE,
+                        RetrievalMode.HYBRID,
+                    ):
+                        vectors["dense"] = chunk.embedding
+
+                    if retrieval_mode in (
+                        RetrievalMode.SPARSE,
+                        RetrievalMode.HYBRID,
+                    ):
+                        vectors["sparse"] = QdrantSparseVector(
+                            indices=chunk.sparse_embedding.indices,
+                            values=chunk.sparse_embedding.values,
+                        )
+
+                    points.append(
+                        PointStruct(
+                            id=chunk.id,
+                            vector=vectors,
+                            payload={
+                                "page_content": chunk.content,
+                                "metadata": chunk.metadata,
+                            },
+                        )
+                    )
+
+                constants.vectorstore.upsert(
+                    collection_name=self.collection_name,
+                    points=points,
+                    wait=True,
+                )
+
+                logger.info(
+                    f"Uploaded Qdrant batch: "
+                    f"{min(start + len(batch_chunks), expected_count)}"
+                    f"/{expected_count} chunks for document {document_id}."
+                )
+
+            stored_count = self._count_document_points(str(document_id))
+
+            if stored_count != expected_count:
+                raise RuntimeError(
+                    f"Qdrant stored {stored_count} of {expected_count} chunks "
+                    f"for document {document_id}."
+                )
 
             logger.info(
-                f"Stored {len(langchain_documents)} chunks in Qdrant for tenant {self.tenant_id}"
+                f"Verified {stored_count}/{expected_count} chunks in Qdrant "
+                f"for document {document_id}, tenant {self.tenant_id}."
             )
 
         except Exception as e:
-            logger.error(f"Error storing in Qdrant: {e}")
+            logger.error(
+                f"Error storing document {document_id} in Qdrant: {e}"
+            )
+
+            try:
+                self._remove_partial_document(str(document_id))
+            except Exception as cleanup_error:
+                logger.exception(
+                    f"CRITICAL: Could not clean partial Qdrant data for "
+                    f"document {document_id}: {cleanup_error}"
+                )
+                raise RuntimeError(
+                    f"Ingestion failed and Qdrant cleanup also failed for "
+                    f"document {document_id}: {cleanup_error}"
+                ) from e
+
             raise
 
     def create_tenant_filter(self) -> Filter:
@@ -488,7 +644,6 @@ class DocumentIngestionEngine:
             )
             return 0
 
-
     def list_documents(self) -> list[dict[str, Any]]:
         """
         Return every distinct document that has been ingested for the current tenant.
@@ -583,7 +738,7 @@ class DocumentIngestionEngine:
             logger.info(
                 f"Starting ingestion of: {filename} for tenant: {self.tenant_id}"
             )
-
+            stage_start = time.perf_counter()
             # ---- 3.  pdf → markdown → chunks → embeddings → qdrant -------
             markdown_content, page_boundaries = (
                 self._pdf_to_markdown_with_pages(
@@ -591,6 +746,13 @@ class DocumentIngestionEngine:
                 )
             )
 
+            logger.info(
+                f"[TIMING] PDF to Markdown: "
+                f"{time.perf_counter() - stage_start:.2f}s; "
+                f"{len(markdown_content):,} characters"
+            )
+
+            stage_start = time.perf_counter()
             chunks = self._chunk_markdown(
                 markdown_content,
                 base_metadata,
@@ -700,43 +862,45 @@ class DocumentIngestionEngine:
             return False
 
     def delete_documents_by_document_id(self, document_id: str) -> tuple[bool, int]:
-        """Delete all chunks for a specific document_id. Returns (success, deleted_count)."""
+        """Delete a document's points and verify removal before returning success."""
+        document_filter = self._document_filter(document_id)
         try:
-            # First count how many documents we're going to delete
-            document_filter = Filter(
-                must=[
-                    FieldCondition(
-                        key="metadata.tenant_id",
-                        match=MatchValue(value=self.tenant_id),
-                    ),
-                    FieldCondition(
-                        key="metadata.document_id", match=MatchValue(value=document_id)
-                    ),
-                ]
-            )
-
             existing_count = constants.vectorstore.count(
-                collection_name=self.collection_name, count_filter=document_filter
+                collection_name=self.collection_name,
+                count_filter=document_filter,
+                exact=True,
             ).count
 
             if existing_count == 0:
                 logger.warning(
-                    f"No documents found with document_id: {document_id}")
+                    f"No Qdrant points found for document_id: {document_id}")
                 return False, 0
 
-            delete_result = constants.vectorstore.delete(
-                collection_name=self.collection_name, points_selector=document_filter
+            constants.vectorstore.delete(
+                collection_name=self.collection_name,
+                points_selector=document_filter,
+                wait=True,
             )
 
+            remaining_count = constants.vectorstore.count(
+                collection_name=self.collection_name,
+                count_filter=document_filter,
+                exact=True,
+            ).count
+            if remaining_count != 0:
+                raise RuntimeError(
+                    f"Qdrant deletion incomplete for {document_id}: "
+                    f"{remaining_count} points remain."
+                )
+
             logger.info(
-                f"Deleted {existing_count} chunks for document_id: {document_id}"
+                f"Verified deletion of {existing_count} chunks for document_id: {document_id}"
             )
             return True, existing_count
 
         except Exception as e:
-            logger.error(
-                f"Error deleting documents by document_id {document_id}: {e}")
-            return False, 0
+            logger.exception(f"Error deleting document_id {document_id}: {e}")
+            raise
 
 
 def get_ingestion_engine(
