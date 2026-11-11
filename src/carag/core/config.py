@@ -94,6 +94,11 @@ class Settings(BaseSettings):
     CHUNK_TEXT_DIVIDER_FACTOR: int = 2
     TAGGER_N_CHUNKS_PER_BATCH: int = 5
 
+    MINERU_TABLE_MERGE_ENABLE: bool = False
+    MINERU_LLM_TITLE_ENABLE: bool = False
+    MINERU_PAGE_BATCH_SIZE: int = Field(default=20, ge=1)
+    INGEST_CHUNK_BATCH_SIZE: int = Field(default=8, ge=1)
+    
     # Bhasini ULCA
     BHASINI_ULCA_API_KEY: str = ""
     BHASINI_ULCA_USER_ID: str = ""

@@ -28,6 +28,9 @@ from qdrant_client.models import (
 from carag.core.config import get_settings
 from carag.core.constants import get_constants
 from carag.services.document_ingestion.chunker import get_chunker
+from carag.services.document_ingestion.utils.html_table_processor import (
+    SOURCE_RANGE_MARKER_RE,
+)
 from carag.services.document_ingestion.models import (
     DocumentChunk,
     IngestedDocument,
@@ -114,34 +117,31 @@ class DocumentIngestionEngine:
         """
         loader = constants.loader(file_path)
 
-        documents = loader.load()
-
         parts: list[str] = []
         page_boundaries: list[dict[str, int]] = []
-
         cursor = 0
+        separator = "\n\n"
 
-        for document in documents:
+        # Iterate the loader directly. MinerU itself works page-batch by page-batch;
+        # avoid BaseLoader.load() creating another complete list of Documents.
+        for document in loader.lazy_load():
             content = document.page_content
-
             if not content:
                 continue
 
             if parts:
-                cursor += 2  # "\n\n" separator
+                cursor += len(separator)
+                # Attribute the inter-page separator to the preceding page so a
+                # chunk beginning there still receives a deterministic page number.
+                if page_boundaries:
+                    page_boundaries[-1]["end"] = cursor
 
             start = cursor
-
             parts.append(content)
-
             cursor += len(content)
-
             end = cursor
 
-            page_number = document.metadata.get(
-                "page_number"
-            )
-
+            page_number = document.metadata.get("page_number")
             if page_number is not None:
                 page_boundaries.append(
                     {
@@ -151,7 +151,9 @@ class DocumentIngestionEngine:
                     }
                 )
 
-        markdown_content = "\n\n".join(parts)
+        markdown_content = separator.join(parts)
+        parts.clear()
+        del parts
 
         return markdown_content, page_boundaries
 
@@ -206,6 +208,7 @@ class DocumentIngestionEngine:
             chunks = chunker.chunk(
                 markdown_content,
                 metadata,
+                page_boundaries=page_boundaries,
             )
 
             document_chunks = []
@@ -213,6 +216,24 @@ class DocumentIngestionEngine:
             search_from = 0
 
             for i, chunk in enumerate(chunks):
+                # Table chunks are transformed from MinerU HTML into Markdown,
+                # so they are no longer literal substrings of the original PDF
+                # Markdown. Consume the source-range marker before embedding and
+                # use its original offset for page-number assignment.
+                source_range_match = SOURCE_RANGE_MARKER_RE.search(chunk)
+                source_offset_start = None
+                source_offset_end = None
+                source_pages: list[int] = []
+                if source_range_match:
+                    source_offset_start = int(source_range_match.group(1))
+                    source_offset_end = int(source_range_match.group(2))
+                    if source_range_match.group(3):
+                        source_pages = [
+                            int(value)
+                            for value in source_range_match.group(3).split(",")
+                            if value
+                        ]
+                    chunk = SOURCE_RANGE_MARKER_RE.sub("", chunk).strip()
 
                 chunk_metadata = metadata.copy()
 
@@ -226,14 +247,35 @@ class DocumentIngestionEngine:
                 )
 
                 if page_boundaries:
-                    page_number, search_from = (
-                        self._get_chunk_page_number(
+                    if source_offset_start is not None:
+                        if not source_pages and source_offset_end is not None:
+                            source_pages = [
+                                int(boundary["page_number"])
+                                for boundary in page_boundaries
+                                if boundary["start"] < source_offset_end
+                                and boundary["end"] > source_offset_start
+                            ]
+                        page_number = source_pages[0] if source_pages else next(
+                            (
+                                boundary["page_number"]
+                                for boundary in page_boundaries
+                                if boundary["start"]
+                                <= source_offset_start
+                                < boundary["end"]
+                            ),
+                            None,
+                        )
+                        if source_pages:
+                            chunk_metadata["source_pages"] = source_pages
+                        if source_offset_end is not None:
+                            search_from = max(search_from, source_offset_end)
+                    else:
+                        page_number, search_from = self._get_chunk_page_number(
                             chunk=chunk,
                             markdown_content=markdown_content,
                             page_boundaries=page_boundaries,
                             search_from=search_from,
                         )
-                    )
 
                     if page_number is not None:
                         chunk_metadata["page_number"] = page_number
@@ -414,14 +456,13 @@ class DocumentIngestionEngine:
         ingested_document: IngestedDocument,
         retrieval_mode: RetrievalMode = RetrievalMode.HYBRID,
     ) -> None:
-        """Store precomputed chunk embeddings and verify the complete document."""
+        """Embed and upsert chunks incrementally, then verify the whole document."""
         document_id = ingested_document.metadata.get("document_id")
         if not document_id:
             raise ValueError("document_id is required in ingestion metadata.")
 
         chunks = ingested_document.chunks
         expected_count = len(chunks)
-
         if expected_count == 0:
             raise ValueError("Cannot store a document with zero chunks.")
 
@@ -431,54 +472,67 @@ class DocumentIngestionEngine:
                 f"Document ID {document_id} already has {existing_count} Qdrant points."
             )
 
-        batch_size = 32
+        batch_size = max(1, int(settings.INGEST_CHUNK_BATCH_SIZE))
 
         try:
-            for index, chunk in enumerate(chunks):
-                if chunk.embedding is None or chunk.sparse_embedding is None:
-                    raise ValueError(
-                        f"Chunk {index} is missing a dense or sparse embedding."
-                    )
-
-                if len(chunk.embedding) != int(settings.EMBEDDINGS_API_DIMENSION):
-                    raise ValueError(
-                        f"Chunk {index} has an invalid dense embedding dimension."
-                    )
-
-                if (
-                    not chunk.sparse_embedding.indices
-                    or not chunk.sparse_embedding.values
-                    or len(chunk.sparse_embedding.indices)
-                    != len(chunk.sparse_embedding.values)
-                ):
-                    raise ValueError(
-                        f"Chunk {index} has an invalid sparse embedding."
-                    )
-
-                chunk.metadata["tenant_id"] = self.tenant_id
-
             for start in range(0, expected_count, batch_size):
-                batch_chunks = chunks[start: start + batch_size]
-                points = []
+                batch_chunks = chunks[start : start + batch_size]
+                batch_started = time.perf_counter()
 
+                # New ingestion passes unembedded chunks here. Retain compatibility
+                # with callers/tests that already supply complete embeddings.
+                embeddings_present = all(
+                    chunk.embedding is not None and chunk.sparse_embedding is not None
+                    for chunk in batch_chunks
+                )
+                generated_embeddings = not embeddings_present
+                if generated_embeddings:
+                    self._embed_chunks(batch_chunks)
+
+                for offset, chunk in enumerate(batch_chunks):
+                    absolute_index = start + offset
+                    if chunk.embedding is None or chunk.sparse_embedding is None:
+                        raise ValueError(
+                            f"Chunk {absolute_index} is missing a dense or sparse embedding."
+                        )
+
+                    if len(chunk.embedding) != int(settings.EMBEDDINGS_API_DIMENSION):
+                        raise ValueError(
+                            f"Chunk {absolute_index} has an invalid dense embedding dimension."
+                        )
+
+                    if not all(math.isfinite(float(value)) for value in chunk.embedding):
+                        raise ValueError(
+                            f"Dense embedding for chunk {absolute_index} contains non-finite values."
+                        )
+
+                    sparse_indices = chunk.sparse_embedding.indices
+                    sparse_values = chunk.sparse_embedding.values
+                    if (
+                        not sparse_indices
+                        or not sparse_values
+                        or len(sparse_indices) != len(sparse_values)
+                    ):
+                        raise ValueError(
+                            f"Chunk {absolute_index} has an invalid sparse embedding."
+                        )
+                    if not all(math.isfinite(float(value)) for value in sparse_values):
+                        raise ValueError(
+                            f"Sparse embedding for chunk {absolute_index} contains non-finite values."
+                        )
+
+                    chunk.metadata["tenant_id"] = self.tenant_id
+
+                points = []
                 for chunk in batch_chunks:
                     vectors = {}
-
-                    if retrieval_mode in (
-                        RetrievalMode.DENSE,
-                        RetrievalMode.HYBRID,
-                    ):
+                    if retrieval_mode in (RetrievalMode.DENSE, RetrievalMode.HYBRID):
                         vectors["dense"] = chunk.embedding
-
-                    if retrieval_mode in (
-                        RetrievalMode.SPARSE,
-                        RetrievalMode.HYBRID,
-                    ):
+                    if retrieval_mode in (RetrievalMode.SPARSE, RetrievalMode.HYBRID):
                         vectors["sparse"] = QdrantSparseVector(
                             indices=chunk.sparse_embedding.indices,
                             values=chunk.sparse_embedding.values,
                         )
-
                     points.append(
                         PointStruct(
                             id=chunk.id,
@@ -496,14 +550,31 @@ class DocumentIngestionEngine:
                     wait=True,
                 )
 
+                completed = min(start + len(batch_chunks), expected_count)
                 logger.info(
-                    f"Uploaded Qdrant batch: "
-                    f"{min(start + len(batch_chunks), expected_count)}"
-                    f"/{expected_count} chunks for document {document_id}."
+                    "Uploaded Qdrant batch: {}/{} chunks for document {}.",
+                    completed,
+                    expected_count,
+                    document_id,
+                )
+                logger.info(
+                    "[TIMING] Embed + Qdrant batch {}/{}: {:.2f}s ({} chunks).",
+                    (start // batch_size) + 1,
+                    math.ceil(expected_count / batch_size),
+                    time.perf_counter() - batch_started,
+                    len(batch_chunks),
                 )
 
-            stored_count = self._count_document_points(str(document_id))
+                # Qdrant has acknowledged this batch (wait=True). Release vectors
+                # generated here; preserve precomputed vectors for compatibility
+                # with callers that deliberately supplied them.
+                if generated_embeddings:
+                    for chunk in batch_chunks:
+                        chunk.embedding = None
+                        chunk.sparse_embedding = None
+                del points, batch_chunks
 
+            stored_count = self._count_document_points(str(document_id))
             if stored_count != expected_count:
                 raise RuntimeError(
                     f"Qdrant stored {stored_count} of {expected_count} chunks "
@@ -511,27 +582,28 @@ class DocumentIngestionEngine:
                 )
 
             logger.info(
-                f"Verified {stored_count}/{expected_count} chunks in Qdrant "
-                f"for document {document_id}, tenant {self.tenant_id}."
+                "Verified {}/{} chunks in Qdrant for document {}, tenant {}.",
+                stored_count,
+                expected_count,
+                document_id,
+                self.tenant_id,
             )
 
         except Exception as e:
-            logger.error(
-                f"Error storing document {document_id} in Qdrant: {e}"
-            )
-
+            logger.error(f"Error storing document {document_id} in Qdrant: {e}")
             try:
                 self._remove_partial_document(str(document_id))
             except Exception as cleanup_error:
                 logger.exception(
-                    f"CRITICAL: Could not clean partial Qdrant data for "
-                    f"document {document_id}: {cleanup_error}"
+                    "CRITICAL: Could not clean partial Qdrant data for "
+                    "document {}: {}",
+                    document_id,
+                    cleanup_error,
                 )
                 raise RuntimeError(
                     f"Ingestion failed and Qdrant cleanup also failed for "
                     f"document {document_id}: {cleanup_error}"
                 ) from e
-
             raise
 
     def create_tenant_filter(self) -> Filter:
@@ -758,18 +830,30 @@ class DocumentIngestionEngine:
                 base_metadata,
                 page_boundaries,
             )
-            embedded_chunks = self._embed_chunks(chunks)
+            logger.info(
+                "[TIMING] Chunking: {:.2f}s; {} chunks.",
+                time.perf_counter() - stage_start,
+                len(chunks),
+            )
+            # The chunks now own their text. Release the full-document source
+            # string and page-boundary array before starting embedding batches.
+            del markdown_content, page_boundaries
 
             ingested_doc = IngestedDocument(
                 original_filename=filename,
                 file_path=file_path,
                 file_size=file_stats.st_size,
-                chunks=embedded_chunks,
+                chunks=chunks,
                 metadata=base_metadata,
-                processing_time=time.time() - start_time,
             )
 
+            stage_start = time.perf_counter()
             self._store_in_qdrant(ingested_doc)
+            logger.info(
+                "[TIMING] Incremental embedding + Qdrant storage: {:.2f}s.",
+                time.perf_counter() - stage_start,
+            )
+            ingested_doc.processing_time = time.time() - start_time
 
             logger.info(
                 f"Successfully ingested document in {ingested_doc.processing_time:.2f}s "
